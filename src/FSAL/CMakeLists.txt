@@ -70,3 +70,7 @@ endif(USE_FSAL_KVSFS)
 if(USE_FSAL_MEM)
   add_subdirectory(FSAL_MEM)
 endif(USE_FSAL_MEM)
+
+if(USE_FSAL_DOTFS)
+  add_subdirectory(FSAL_DOTFS)
+endif(USE_FSAL_DOTFS)
