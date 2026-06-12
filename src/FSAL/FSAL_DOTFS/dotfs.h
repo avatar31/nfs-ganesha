@@ -27,6 +27,8 @@
 #ifndef DOTFS_H
 #define DOTFS_H
 
+#include <pthread.h>
+
 #include "fsal_api.h"
 #include "FSAL/fsal_commonlib.h"
 #include "FSAL/access_check.h"
@@ -37,16 +39,81 @@
  */
 #define DOTFS_HANDLE_MAX_LEN 1088
 
+/* sizeof(((struct sockaddr_un *)0)->sun_path) */
+#define SOCK_PATH_MAX 108
+
+#define LogInfoMsg(...) LogInfo(COMPONENT_FSAL, __VA_ARGS__)
+#define LogEventMsg(...) LogEvent(COMPONENT_FSAL, __VA_ARGS__)
+#define LogDebugMsg(...) LogDebug(COMPONENT_FSAL, __VA_ARGS__)
+#define LogErrorMsg(...) LogCrit(COMPONENT_FSAL, __VA_ARGS__)
+#define LogWarnMsg(...) LogWarn(COMPONENT_FSAL, __VA_ARGS__)
+#define LogFatalMsg(...) LogFatal(COMPONENT_FSAL, __VA_ARGS__)
+
+/**
+ * @brief Thread-safely fetches the string description of an error code.
+ * @param errnum The error number (usually errno or a saved copy).
+ * @param buf Target buffer to hold the error string.
+ * @param buflen Total capacity of the target buffer.
+ * @return A pointer to the error message string.
+ */
+static inline const char *get_error_str(int errnum, char *buf, size_t buflen)
+{
+#if defined(__GLIBC__) &&                                           \
+	(!defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200112L) && \
+	!defined(_XOPEN_SOURCE)
+	return (strerror_r(errnum, buf, buflen));
+#else
+	if (strerror_r(errnum, buf, buflen) == 0) {
+		return (buf);
+	}
+	return ("Unknown systemic error");
+#endif
+}
+
+/**
+ * @brief Logs a system error along with its human-readable string.
+ * Automatically handles thread-safe buffer allocation.
+ */
+#define LogSysError(msg, errnum)                                      \
+	do {                                                          \
+		char _macro_err_buf[256];                             \
+		LogErrorMsg("%s. System Error: %s (code: %d)", (msg), \
+			    get_error_str((errnum), _macro_err_buf,   \
+					  sizeof(_macro_err_buf)),    \
+			    (errnum));                                \
+	} while (0)
+
+typedef enum {
+	DFS_PASS = 0x00,
+	DFS_FAIL = 0x01,
+} dfs_status_t;
+
+/* Runtime socket context structure */
+typedef struct {
+	char socket_path[SOCK_PATH_MAX];
+	int sock_fd;
+	int connect_timeout_ms;
+	int io_timeout_ms;
+	int max_retries;
+	int retry_delay_sec;
+	pthread_mutex_t lock; /* Protects sock_fd during runtime reconnects */
+} socket_context_t;
+
 /* ---------------------------------------------------------------------------
  * Module-level private storage
  *
  * Embeds fsal_module so that container_of() can cast back and forth between
  * the Ganesha generic type and our private extension.
  * ------------------------------------------------------------------------- */
-typedef struct {
+struct dotfs_fsal_module {
 	struct fsal_module module;
 	struct fsal_obj_ops handle_ops;
-} dotfs_fsal_module_t;
+
+	// Socket details for talking to the dotfs daemon.
+	socket_context_t sock_ctx;
+};
+
+typedef struct dotfs_fsal_module dotfs_fsal_module_t;
 
 /* ---------------------------------------------------------------------------
  * Per-file-descriptor state
@@ -265,5 +332,18 @@ void dotfs_handle_to_key(struct fsal_obj_handle *obj_hdl,
 struct state_t *dotfs_alloc_state(struct fsal_export *exp_hdl,
 				  enum state_type state_type,
 				  struct state_t *related_state);
+
+/* ---------------------------------------------------------------------------
+ * Socket Helpers  (sock.c)
+ * ------------------------------------------------------------------------- */
+
+dfs_status_t initialize_socket_ctx(socket_context_t *ctx);
+dfs_status_t socket_connect(socket_context_t *ctx);
+dfs_status_t socket_reconnect(socket_context_t *ctx);
+ssize_t socket_send_message(socket_context_t *ctx, const void *data,
+			    size_t len);
+ssize_t socket_recv_message(socket_context_t *ctx, void *buffer,
+				size_t max_len);
+void socket_close(socket_context_t *ctx);
 
 #endif /* DOTFS_H */

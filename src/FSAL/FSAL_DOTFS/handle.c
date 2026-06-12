@@ -40,7 +40,8 @@ void dotfs_handle_ops_init(struct fsal_obj_ops *ops)
 	fsal_default_obj_ops_init(ops);
 
 	// Namespace ops
-	ops->release = dotfs_release_obj;
+	ops->release = dotfs_release_obj;	// TODO: Yet to implement
+
 	ops->merge = dotfs_merge;
 	ops->lookup = dotfs_lookup;
 	ops->readdir = dotfs_readdir;

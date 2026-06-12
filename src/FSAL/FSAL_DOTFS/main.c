@@ -22,6 +22,13 @@
  * -------------
  */
 
+#include <limits.h>
+#include "config.h"
+#include "fsal.h"
+#include "FSAL/fsal_init.h"
+
+#include "dotfs.h"
+
 /* =========================================================================
  * Supported attribute mask
  *
@@ -29,13 +36,6 @@
  * size, atime, mtime, ctime, nlink, …).  Extend this once dotfs adds
  * ACL support (ATTR_ACL) or xattr support (ATTR4_XATTR).
  * ========================================================================= */
-
-#include <limits.h>
-
-#include "FSAL/fsal_init.h"
-
-#include "dotfs.h"
-
 #define DOTFS_SUPPORTED_ATTRIBUTES ((const attrmask_t)(ATTRS_POSIX))
 
 static const char myname[] = "DOTFS";
@@ -72,7 +72,6 @@ static dotfs_fsal_module_t DOTFS = {
     }
 };
 
-
 /* =========================================================================
  * Module-level config parameters
  *
@@ -87,20 +86,44 @@ static dotfs_fsal_module_t DOTFS = {
  * ========================================================================= */
 
 static struct config_item dotfs_params[] = {
-    // Everything is hard coded for now, 
-    // but we can add config options here in the future if needed
-    CONFIG_EOL
+	// Assuming file is already created by systemd
+	CONF_ITEM_STR("socket_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
+		      sock_ctx.socket_path),
+	CONFIG_EOL
 };
 
 struct config_block dotfs_param_block = {
-    .dbus_interface_name = "org.ganesha.nfsd.config.fsal.dotfs",
+	.dbus_interface_name = "org.ganesha.nfsd.config.fsal.dotfs",
 	.blk_desc.name = "DOTFS",
-	.blk_desc.type = CONFIG_BLOCK,              // TODO: What is this field for?
-	.blk_desc.flags = CONFIG_UNIQUE,            // TODO: What is this field for?
-	.blk_desc.u.blk.init = noop_conf_init,      // TODO: What is this field for?
-	.blk_desc.u.blk.params = dotfs_params,      // TODO: What is this field for?
-	.blk_desc.u.blk.commit = noop_conf_commit   // TODO: What is this field for?
+	.blk_desc.type = CONFIG_BLOCK, // TODO: What is this field for?
+	.blk_desc.flags = CONFIG_UNIQUE, // TODO: What is this field for?
+	.blk_desc.u.blk.init = noop_conf_init, // TODO: What is this field for?
+	.blk_desc.u.blk.params = dotfs_params, // TODO: What is this field for?
+	.blk_desc.u.blk.commit = noop_conf_commit // TODO: What is this field for?
 };
+
+/**
+ * init_sock — initialize the DOTFS socket context and connect to the daemon.
+ * @param[in,out] dotfs_module The DOTFS module singleton containing the socket context to initialize.
+ * 
+ * @return DFS_PASS on success, DFS_FAIL on failure.
+ */
+static dfs_status_t init_sock(dotfs_fsal_module_t *dotfs_module)
+{
+	dfs_status_t status = initialize_socket_ctx(&dotfs_module->sock_ctx);
+	if (status != DFS_PASS) {
+		LogErrorMsg("Failed to initialize socket context");
+		return (status);
+	}
+
+	status = socket_connect(&dotfs_module->sock_ctx);
+	if (status != DFS_PASS) {
+		LogErrorMsg("Failed to connect to dotfs daemon");
+		return (status);
+	}
+
+	return (status);
+}
 
 /**
  * init_config — parse module-level DOTFS config and validate the environment.
@@ -120,27 +143,29 @@ static fsal_status_t init_config(struct fsal_module *fsal_module_hdl,
 				 config_file_t config_struct,
 				 struct config_error_type *err_type)
 {
-    // TODO: Check Unix socket path is exist and writable
-
-    dotfs_fsal_module_t *dotfs_module =
+	dotfs_fsal_module_t *dotfs_module =
 		container_of(fsal_module_hdl, dotfs_fsal_module_t, module);
 
 	(void)load_config_from_parse(config_struct, &dotfs_param_block,
 				     dotfs_module, true, err_type);
 	if (!config_error_is_harmless(err_type)) {
 		return fsalstat(ERR_FSAL_INVAL, 0);
-    }
+	}
 
 	display_fsinfo(&dotfs_module->module);
 
-    LogDebug(COMPONENT_FSAL,
-        "DOTFS: supported_attrs=0x%" PRIx64 " maxread=%" PRIu64
-		" maxwrite=%" PRIu64,
-		dotfs_module->module.fs_info.supported_attrs,
-		dotfs_module->module.fs_info.maxread,
-		dotfs_module->module.fs_info.maxwrite);
+	LogDebugMsg("DOTFS: supported_attrs=0x%" PRIx64 " maxread=%" PRIu64
+		    " maxwrite=%" PRIu64,
+		    dotfs_module->module.fs_info.supported_attrs,
+		    dotfs_module->module.fs_info.maxread,
+		    dotfs_module->module.fs_info.maxwrite);
 
-    return fsalstat(ERR_FSAL_NO_ERROR, 0);
+	dfs_status_t status = init_sock(dotfs_module);
+	if (status != DFS_PASS) {
+		return fsalstat(ERR_FSAL_FAULT, 0);
+	}
+
+	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
@@ -154,14 +179,13 @@ static fsal_status_t init_config(struct fsal_module *fsal_module_hdl,
  */
 MODULE_INIT void dotfs_init(void)
 {
-    int retval;
+	int retval;
 	struct fsal_module *myself = &DOTFS.module;
 
-    retval = register_fsal(myself, myname, FSAL_MAJOR_VERSION,
-        FSAL_MINOR_VERSION, FSAL_ID_NO_PNFS);
+	retval = register_fsal(myself, myname, FSAL_MAJOR_VERSION,
+			       FSAL_MINOR_VERSION, FSAL_ID_NO_PNFS);
 	if (retval != 0) {
-        LogCrit(COMPONENT_FSAL, "DOTFS: module failed to register (rc=%d)\n",
-            retval);
+		LogErrorMsg("DOTFS: module failed to register (rc=%d)\n", retval);
 		return;
 	}
 
@@ -170,11 +194,11 @@ MODULE_INIT void dotfs_init(void)
 	myself->m_ops.update_export = dotfs_update_export;
 	myself->m_ops.init_config = init_config;
 
-    /* Populate the shared handle ops table used by all object handles
+	/* Populate the shared handle ops table used by all object handles
 	 * created under any DOTFS export. */
 	dotfs_handle_ops_init(&DOTFS.handle_ops);
 
-	LogInfo(COMPONENT_FSAL, "DOTFS module registered as \"%s\"", myname);
+	LogInfoMsg("DOTFS module registered as \"%s\"", myname);
 }
 
 /**
@@ -187,14 +211,13 @@ MODULE_INIT void dotfs_init(void)
  */
 MODULE_FINI void dotfs_unload(void)
 {
-    int retval = unregister_fsal(&DOTFS.module);
+	int retval = unregister_fsal(&DOTFS.module);
 	if (retval != 0) {
-        LogCrit(COMPONENT_FSAL, "DOTFS: module failed to unregister (rc=%d)\n",
-            retval);
+		LogErrorMsg("failed to unregister (rc=%d)\n", retval);
 		return;
 	}
 
-    // TODO: walk the exports list and assert it is empty; log leaked contexts.
+	// TODO: walk the exports list and assert it is empty; log leaked contexts.
 
-	LogInfo(COMPONENT_FSAL, "DOTFS module unregistered");
+	LogInfoMsg("DOTFS module unregistered");
 }

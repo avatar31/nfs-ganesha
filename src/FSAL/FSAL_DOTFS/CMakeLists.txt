@@ -28,6 +28,7 @@ set(fsaldotfs_LIB_SRCS
   main.c
   export.c
   handle.c
+  sock.c
   dotfs.h
 )
 
