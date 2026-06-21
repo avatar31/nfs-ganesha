@@ -156,9 +156,15 @@ fsal_status_t dotfs_lookup(struct fsal_obj_handle *parent, const char *name,
 	 *   *handle = &hdl->obj_handle;
 	 */
 	(void)parent;
-	(void)name;
-	(void)handle;
-	(void)attrs_out;
+    (void)name;
+
+    if (handle != NULL) {
+        *handle = NULL;
+    }
+    if (attrs_out != NULL) {
+        memset(attrs_out, 0, sizeof(struct fsal_attrlist));
+    }
+
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -193,12 +199,15 @@ fsal_status_t dotfs_readdir(struct fsal_obj_handle *dir_hdl,
 	 *   Set *eof when IterateByPrefix returns empty next cursor.
 	 */
 	(void)dir_hdl;
-	(void)whence;
-	(void)dir_state;
-	(void)cb;
-	(void)attrmask;
-	*eof = true;
-	return fsalstat(ERR_FSAL_NOTSUPP, 0);
+    (void)whence;
+    (void)dir_state;
+    (void)cb;
+    (void)attrmask;
+
+    if (eof != NULL) {
+        *eof = true; // Tell Ganesha there's nothing here to read
+    }
+    return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
 /**
@@ -236,8 +245,11 @@ fsal_status_t dotfs_mkdir(struct fsal_obj_handle *dir_hdl, const char *name,
 	(void)dir_hdl;
 	(void)name;
 	(void)attrib;
-	(void)new_obj;
 	(void)attrs_out;
+
+	if (new_obj != NULL) {
+        *new_obj = NULL; 
+    }
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -273,6 +285,11 @@ fsal_status_t dotfs_mknode(struct fsal_obj_handle *dir_hdl, const char *name,
 	(void)attrib;
 	// (void)new_obj;
 	(void)attrs_out;
+
+	if (handle != NULL) {
+        *handle = NULL; 
+    }
+
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -308,6 +325,11 @@ fsal_status_t dotfs_symlink(struct fsal_obj_handle *dir_hdl, const char *name,
 	(void)attrib;
 	// (void)new_obj;
 	(void)attrs_out;
+
+	if (handle != NULL) {
+        *handle = NULL; 
+    }
+
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -372,8 +394,11 @@ fsal_status_t dotfs_getattrs(struct fsal_obj_handle *obj_hdl,
 	 *   populate attrs_out from meta fields.
 	 */
 	(void)obj_hdl;
-	(void)attrs_out;
-	return fsalstat(ERR_FSAL_NOTSUPP, 0);
+
+    if (attrs_out != NULL) {
+        memset(attrs_out, 0, sizeof(struct fsal_attrlist));
+    }
+    return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
 /**

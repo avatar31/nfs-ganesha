@@ -37,16 +37,12 @@ add_sanitizers(fsaldotfs)
 
 target_link_libraries(fsaldotfs
   ganesha_nfsd
-  ${SYSTEM_LIBRARIES}
-  ${LDFLAG_DISALLOW_UNDEF}
+  ${SYSTEM_LIBRARIES}       # like pthread, rt, dl
+  ${LTTNG_LIBRARIES}        # Linux Trace Toolkit Next Generation (Tracing tools)
+  ${LDFLAG_DISALLOW_UNDEF}  # compile time safety check
 )
 
 set_target_properties(fsaldotfs PROPERTIES VERSION 4.2.0 SOVERSION 4)
-
-install(
-  TARGETS fsaldotfs
-  COMPONENT fsal
-  DESTINATION ${FSAL_DESTINATION}
-)
+install(TARGETS fsaldotfs COMPONENT fsal DESTINATION ${FSAL_DESTINATION})
 
 ########### install files ###############

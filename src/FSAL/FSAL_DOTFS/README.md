@@ -86,5 +86,69 @@ cd build
 rm -rf *
 clear
 cmake ../../../ -DCMAKE_BUILD_TYPE=Debug -DUSE_FSAL_DOTFS=ON -DUSE_FSAL_VFS=OFF -DUSE_FSAL_PROXY_V4=OFF -DUSE_FSAL_PROXY_V3=OFF -DUSE_FSAL_CEPH=OFF -DUSE_FSAL_GPFS=OFF -DUSE_FSAL_MEM=OFF -DUSE_FSAL_LUSTRE=OFF -DUSE_FSAL_SAUNAFS=OFF
-make -j$(nproc) # make -j$(nproc) fsaldotfs
+make -j$(nproc) # This will generate the ganesha.nfsd binary in the build directory
 ```
+
+## Write the `ganesha.conf` Configuration File
+```conf
+# ganesha.conf
+
+NFS_CORE_PARAM {
+    MNT_Port = 20048;
+    NFS_Port = 2049;
+    FSAL_Path = "/path/to/your/nfs-ganesha/build/FSAL";
+}
+
+LOG {
+    Default_Log_Level = DEBUG;
+    Facility {
+        Name = FILE;
+        Destination = "/tmp/ganesha.log";
+    }
+}
+
+EXPORT {
+    Export_Id = 1;
+    Path = "/mnt/disk2";      # The real local path we mounted above
+    Pseudo = "/xfs_export";   # The virtual path clients use to mount
+    Access_Type = RW;
+    Disable_ACL = true;
+    Squash = No_Root_Squash;
+
+    FSAL {
+        Name = DOTFS;  # Tells Ganesha to use the dotfs FSAL
+    }
+}
+```
+
+## Running the FSAL
+
+### Mode 1: Running in the Foreground (Best for Active Development)
+```bash
+# Pass the -F flag (Foreground) along with the path to your configuration file
+# Press Ctrl + C to stop the server
+sudo ./ganesha.nfsd -F -f ./ganesha.conf -L /tmp/ganesha.log
+```
+
+### Mode 2: Running in the Background (Daemon Mode)
+```bash
+sudo ./ganesha.nfsd -f ./ganesha.conf
+pgrep -l ganesha # verify that the server is running
+
+# Kill
+pkill ganesha.nfsd # or kill $(pidof ganesha.nfsd) or kill $(cat /var/run/ganesha.nfsd.pid)
+```
+
+Debug mode `gdb --args ./ganesha.nfsd -F -f ./ganesha.conf`
+
+### Issues faced during first time run
+1. open(/var/run/ganesha/ganesha.pid, O_CREAT | O_RDWR, 0644) failed for pid file, errno was: No such file or directory (2)
+  - Make sure the directory is created during installation
+2. Failed to create v4 recovery dir (/var/lib/nfs/ganesha), errno: No such file or directory (2)
+  - Make sure the directory is created during installation
+
+> [!NOTE]
+> Checking Memory Leaks with Valgrind
+> ```bash
+>   sudo valgrind --leak-check=full --show-leak-kinds=all ./ganesha.nfsd -F -f ./test_ganesha.conf
+> ```
