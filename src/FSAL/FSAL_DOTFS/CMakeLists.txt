@@ -29,6 +29,8 @@ set(fsaldotfs_LIB_SRCS
   export.c
   handle.c
   sock.c
+  messages.c
+  messages.h
   dotfs.h
 )
 

@@ -33,6 +33,8 @@
 #include "FSAL/fsal_commonlib.h"
 #include "FSAL/access_check.h"
 
+#define FS_NAME "DOTFS"
+
 /**
  * Maximum byte length of a serialised dotfs object handle.
  * Covers a 36-byte UUID string + '/' + up to 1023-char path + NUL.
@@ -90,13 +92,12 @@ typedef enum {
 
 /* Runtime socket context structure */
 typedef struct {
-	char socket_path[SOCK_PATH_MAX];
-	int sock_fd;
-	int connect_timeout_ms;
-	int io_timeout_ms;
-	int max_retries;
-	int retry_delay_sec;
-	pthread_mutex_t lock; /* Protects sock_fd during runtime reconnects */
+	char *inbound_socket_path;
+	int inbound_sock_fd;
+
+	char *outbound_socket_path;
+	int outbound_sock_fd;
+	pthread_mutex_t outbound_sock_fd_lock;
 } socket_context_t;
 
 /* ---------------------------------------------------------------------------
@@ -338,12 +339,15 @@ struct state_t *dotfs_alloc_state(struct fsal_export *exp_hdl,
  * ------------------------------------------------------------------------- */
 
 dfs_status_t initialize_socket_ctx(socket_context_t *ctx);
-dfs_status_t socket_connect(socket_context_t *ctx);
-dfs_status_t socket_reconnect(socket_context_t *ctx);
-ssize_t socket_send_message(socket_context_t *ctx, const void *data,
-			    size_t len);
-ssize_t socket_recv_message(socket_context_t *ctx, void *buffer,
-				size_t max_len);
+dfs_status_t init_inbound_server(socket_context_t *ctx);
+
+// Background threads for handling inbound and outbound socket communication.
+void* inbound_reader_thread(void* arg);
+void* outbound_dialer_thread(void* arg);
+
+dfs_status_t socket_read_message(int fd, uint8_t *buffer, size_t total_len);
+ssize_t socket_send_message(int fd, const uint8_t *buffer, size_t len);
+
 void socket_close(socket_context_t *ctx);
 
 #endif /* DOTFS_H */

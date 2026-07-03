@@ -87,6 +87,7 @@ rm -rf *
 clear
 cmake ../../../ -DCMAKE_BUILD_TYPE=Debug -DUSE_FSAL_DOTFS=ON -DUSE_FSAL_VFS=OFF -DUSE_FSAL_PROXY_V4=OFF -DUSE_FSAL_PROXY_V3=OFF -DUSE_FSAL_CEPH=OFF -DUSE_FSAL_GPFS=OFF -DUSE_FSAL_MEM=OFF -DUSE_FSAL_LUSTRE=OFF -DUSE_FSAL_SAUNAFS=OFF
 make -j$(nproc) # This will generate the ganesha.nfsd binary in the build directory
+cp FSAL/FSAL_DOTFS/libfsaldotfs.so /usr/lib64/ganesha/ # or /usr/lib/ganesha/
 ```
 
 ## Write the `ganesha.conf` Configuration File

@@ -38,8 +38,6 @@
  * ========================================================================= */
 #define DOTFS_SUPPORTED_ATTRIBUTES ((const attrmask_t)(ATTRS_POSIX))
 
-static const char myname[] = "DOTFS";
-
 static dotfs_fsal_module_t DOTFS = {
     .module = {
         .fs_info = {
@@ -87,8 +85,10 @@ static dotfs_fsal_module_t DOTFS = {
 
 static struct config_item dotfs_params[] = {
 	// Assuming file is already created by systemd
-	CONF_ITEM_STR("socket_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
-		      sock_ctx.socket_path),
+	// CONF_ITEM_STR("socket_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
+	// 	      sock_ctx.inbound_socket_path),
+	// CONF_ITEM_STR("fs_socket_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
+	// 	      sock_ctx.outbound_socket_path),
 	CONFIG_EOL
 };
 
@@ -110,19 +110,64 @@ struct config_block dotfs_param_block = {
  */
 static dfs_status_t init_sock(dotfs_fsal_module_t *dotfs_module)
 {
-	dfs_status_t status = initialize_socket_ctx(&dotfs_module->sock_ctx);
-	if (status != DFS_PASS) {
+	pthread_t in_tid, out_tid;
+
+	// TODO: Is this possible?
+	// strncpy(dotfs_module->sock_ctx.inbound_socket_path,
+	// 	dotfs_param_block.blk_desc.u.blk.params[0].u.str_val,
+	// 	SOCK_PATH_MAX);
+	// strncpy(dotfs_module->sock_ctx.outbound_socket_path,
+	// 	dotfs_param_block.blk_desc.u.blk.params[1].u.str_val,
+	// 	SOCK_PATH_MAX);
+
+	dotfs_module->sock_ctx.inbound_socket_path = strdup("/var/run/dotfs/ganesha.sock");
+	if (dotfs_module->sock_ctx.inbound_socket_path == NULL) {
+		LogErrorMsg("Failed to allocate memory for inbound socket path");
+		return (DFS_FAIL);
+	}
+
+    dotfs_module->sock_ctx.outbound_socket_path = strdup("/var/run/dotfs/dotfs.sock");
+	if (dotfs_module->sock_ctx.outbound_socket_path == NULL) {
+		LogErrorMsg("Failed to allocate memory for outbound socket path");
+		free(dotfs_module->sock_ctx.inbound_socket_path);
+		return (DFS_FAIL);
+	}
+
+	if (initialize_socket_ctx(&dotfs_module->sock_ctx) != DFS_PASS) {
 		LogErrorMsg("Failed to initialize socket context");
-		return (status);
+		free(dotfs_module->sock_ctx.inbound_socket_path);
+		free(dotfs_module->sock_ctx.outbound_socket_path);
+		return (DFS_FAIL);
 	}
 
-	status = socket_connect(&dotfs_module->sock_ctx);
-	if (status != DFS_PASS) {
-		LogErrorMsg("Failed to connect to dotfs daemon");
-		return (status);
-	}
+	if (init_inbound_server(&dotfs_module->sock_ctx) != DFS_PASS) {
+        LogErrorMsg("Failed to initialize inbound socket interface. Aborting startup.");
+		free(dotfs_module->sock_ctx.inbound_socket_path);
+		free(dotfs_module->sock_ctx.outbound_socket_path);
+        return (DFS_FAIL);
+    }
 
-	return (status);
+	if (pthread_create(&in_tid, NULL, inbound_reader_thread, &dotfs_module->sock_ctx) != 0) {
+		LogSysError("Failed to create inbound reader thread", errno);
+		close(dotfs_module->sock_ctx.inbound_sock_fd);
+        unlink(dotfs_module->sock_ctx.inbound_socket_path);
+		free(dotfs_module->sock_ctx.inbound_socket_path);
+		free(dotfs_module->sock_ctx.outbound_socket_path);
+		return (DFS_FAIL);
+	}
+	pthread_detach(in_tid);
+
+    if (pthread_create(&out_tid, NULL, outbound_dialer_thread, &dotfs_module->sock_ctx) != 0) {
+		LogSysError("Failed to create inbound reader thread", errno);
+		close(dotfs_module->sock_ctx.inbound_sock_fd);
+        unlink(dotfs_module->sock_ctx.inbound_socket_path);
+		free(dotfs_module->sock_ctx.inbound_socket_path);
+		free(dotfs_module->sock_ctx.outbound_socket_path);
+		return (DFS_FAIL);
+	}
+    pthread_detach(out_tid);
+
+	return (DFS_PASS);
 }
 
 /**
@@ -182,7 +227,7 @@ MODULE_INIT void dotfs_init(void)
 	int retval;
 	struct fsal_module *myself = &DOTFS.module;
 
-	retval = register_fsal(myself, myname, FSAL_MAJOR_VERSION,
+	retval = register_fsal(myself, FS_NAME, FSAL_MAJOR_VERSION,
 			       FSAL_MINOR_VERSION, FSAL_ID_NO_PNFS);
 	if (retval != 0) {
 		LogErrorMsg("DOTFS: module failed to register (rc=%d)\n", retval);
@@ -198,7 +243,7 @@ MODULE_INIT void dotfs_init(void)
 	 * created under any DOTFS export. */
 	dotfs_handle_ops_init(&DOTFS.handle_ops);
 
-	LogInfoMsg("DOTFS module registered as \"%s\"", myname);
+	LogInfoMsg("DOTFS module registered as \"%s\"", FS_NAME);
 }
 
 /**
@@ -211,6 +256,8 @@ MODULE_INIT void dotfs_init(void)
  */
 MODULE_FINI void dotfs_unload(void)
 {
+	socket_close(&DOTFS.sock_ctx);
+
 	int retval = unregister_fsal(&DOTFS.module);
 	if (retval != 0) {
 		LogErrorMsg("failed to unregister (rc=%d)\n", retval);

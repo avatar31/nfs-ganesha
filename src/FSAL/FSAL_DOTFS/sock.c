@@ -34,115 +34,287 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <libgen.h>
 
 #include "dotfs.h"
+#include "messages.h"
 
-const int DEFAULT_CONN_TIMEOUT_MS = 250; // 250 milliseconds
-const int DEFAULT_IO_TIMEOUT_MS = 2000;  // 2 seconds
-const int DEFAULT_MAX_RETRIES = 3;
-const int DEFAULT_RETRY_DELAY_SEC = 1; // 1 second
+#define RECONNECT_RETRY_DELAY_MS	500  	// 0.5 second
+#define INCOMING_SOCKET_BACKLOG 	5
+#define DEFAULT_IO_TIMEOUT_MS		2000	// 2 seconds
 
-static dfs_status_t socket_connect_internal_locked(socket_context_t *ctx);
+dfs_status_t reconnect_outbound_socket(socket_context_t *ctx);
+dfs_status_t dial_socket(int *sock_fd_out, const char *socket_path);
 
-/**
- * @brief Initializes the socket context structure and mutex.
- */
 dfs_status_t initialize_socket_ctx(socket_context_t *ctx)
 {
-	if (!ctx || strlen(ctx->socket_path) == 0 ||
-			strlen(ctx->socket_path) >= SOCK_PATH_MAX) {
+	LogInfoMsg("Inbound socket file: %s", ctx->inbound_socket_path);
+	LogInfoMsg("Outbound socket file: %s", ctx->outbound_socket_path);
+
+	if (!ctx || strlen(ctx->inbound_socket_path) == 0 ||
+			strlen(ctx->inbound_socket_path) >= SOCK_PATH_MAX) {
 		return (DFS_FAIL);
 	}
 
-	if (pthread_mutex_init(&ctx->lock, NULL) != 0) {
+	if (!ctx || strlen(ctx->outbound_socket_path) == 0 ||
+			strlen(ctx->outbound_socket_path) >= SOCK_PATH_MAX) {
 		return (DFS_FAIL);
 	}
 
-	ctx->sock_fd = -1;
-	ctx->connect_timeout_ms = DEFAULT_CONN_TIMEOUT_MS;
-	ctx->io_timeout_ms = DEFAULT_IO_TIMEOUT_MS;
-	ctx->max_retries = DEFAULT_MAX_RETRIES;
-	ctx->retry_delay_sec = DEFAULT_RETRY_DELAY_SEC;
-	
+	if (pthread_mutex_init(&ctx->outbound_sock_fd_lock, NULL) != 0) {
+		return (DFS_FAIL);
+	}
+
+	char path_copy[SOCK_PATH_MAX];
+    strncpy(path_copy, ctx->inbound_socket_path, sizeof(path_copy) - 1);
+    path_copy[sizeof(path_copy) - 1] = '\0';
+
+	char *dir_name = dirname(path_copy);
+	if (mkdir(dir_name, 0755) == -1) {
+        if (errno != EEXIST) {
+			LogSysError("Failed to create directory for socket file.", errno);
+			return (DFS_FAIL);
+		}
+	}
+
+	unlink(ctx->inbound_socket_path);
+
 	return (DFS_PASS);
 }
 
-/**
- * @brief Connect Function wrapping retry loop logic.
- */
-dfs_status_t socket_connect(socket_context_t *ctx)
+dfs_status_t init_inbound_server(socket_context_t *ctx)
 {
-	dfs_status_t status = DFS_FAIL;
+	struct sockaddr_un addr;
+	int listen_fd = -1;
 
-	for (int attempt = 0; attempt <= ctx->max_retries; attempt++) {
-		pthread_mutex_lock(&ctx->lock);
-		status = socket_connect_internal_locked(ctx);
-		pthread_mutex_unlock(&ctx->lock);
+	unlink(ctx->inbound_socket_path);
 
-		if (status == DFS_PASS) {
-			LogEventMsg("Connected successfully to backend via socket.");
-			return (DFS_PASS);
-		}
-
-		LogWarnMsg("Connection attempt %d failed.", attempt + 1);
-
-		if (attempt == ctx->max_retries) {
-			break;
-		}
-
-		LogInfoMsg("Retrying connection (%d of %d)...", attempt + 1,
-			   ctx->max_retries);
-		sleep(ctx->retry_delay_sec);
+	listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (listen_fd < 0) {
+		LogSysError("Failed to create inbound listen socket.", errno);
+		return (DFS_FAIL);
 	}
 
-	LogErrorMsg("All %d connection attempts failed.", ctx->max_retries + 1);
-	return (status);
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, ctx->inbound_socket_path, sizeof(addr.sun_path) - 1);
+	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
+
+	if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		LogSysError("Failed to bind inbound socket path.", errno);
+		close(listen_fd);
+		return (DFS_FAIL);
+	}
+
+	if (listen(listen_fd, 10) < 0) {
+		LogSysError("Failed to listen on inbound socket.", errno);
+		close(listen_fd);
+		unlink(ctx->inbound_socket_path);
+		return (DFS_FAIL);
+	}
+
+	ctx->inbound_sock_fd = listen_fd;
+	LogInfoMsg("Inbound UDS Server started and listening successfully with socket path: %s",
+		ctx->inbound_socket_path);
+	return (DFS_PASS);
 }
 
-/**
- * @brief Internal connect helper. 
- * CRITICAL: Expects ctx->lock to be held by the calling thread.
- */
-static dfs_status_t socket_connect_internal_locked(socket_context_t *ctx)
+void* inbound_reader_thread(void* arg)
+{
+	socket_context_t *ctx = (socket_context_t *)arg;
+	int listen_fd = ctx->inbound_sock_fd;
+
+	LogInfoMsg("Inbound reader thread worker spawned successfully.");
+
+	// Master Accept Loop
+	while (1) {
+		int client_fd = -1;
+
+		do {
+			client_fd = accept(listen_fd, NULL, NULL);
+		} while (client_fd < 0 && errno == EINTR);
+
+		if (client_fd < 0) {
+			LogSysError("Accept failed on inbound socket.", errno);
+			sleep(RECONNECT_RETRY_DELAY_MS);	// 0.5s
+			continue;
+		}
+
+		LogInfoMsg("Accepted a new incoming client connection.");
+
+		while (1) {
+			uint8_t frame[WIRE_FRAME_HEADER_SIZE];
+			dfs_status_t status = socket_read_message(client_fd, frame, WIRE_FRAME_HEADER_SIZE);
+			if (status != DFS_PASS) {
+				break;
+			}
+
+			uint16_t type_id = get_message_type(frame);
+			uint16_t fixed_len = get_message_fixed_length(frame);
+			if (fixed_len == 0) {
+				LogErrorMsg("Protocol Violation, Received 0-length message for type %u. Dropping client.", type_id);
+				break;
+			}
+
+			uint8_t* fixed_buf = malloc(fixed_len);
+			if (!fixed_buf) {
+				LogErrorMsg("Memory allocation failed for incoming message body.");
+				break; 
+			}
+
+			status = socket_read_message(client_fd, fixed_buf, fixed_len);
+			if (status != DFS_PASS) {
+				LogErrorMsg("Failed to read complete message body from inbound client.");
+				free(fixed_buf);
+				break;
+			}
+
+			int drop_client = 0;
+			switch (type_id) {
+				// TODO: Add your valid message cases here
+				
+				default: {
+					LogErrorMsg("Unknown message type received: %u. Dropping connection.", type_id);
+					drop_client = 1;
+					break;
+				}
+			}
+
+			free(fixed_buf);
+			if (drop_client) {
+				break;
+			}
+		}
+
+		close(client_fd);
+	}
+
+	return (NULL);
+}
+
+dfs_status_t socket_read_message(int fd, uint8_t *buffer, size_t total_len)
+{
+	if (!buffer || total_len == 0) {
+		return (DFS_FAIL);
+	}
+
+	uint8_t *ptr = buffer;
+	size_t bytes_left = total_len;
+
+	// Loop until we have read EXACTLY the number of bytes requested
+	while (bytes_left > 0) {
+		struct pollfd pfd;
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+
+		int pol_rc;
+		do {
+			pol_rc = poll(&pfd, 1, DEFAULT_IO_TIMEOUT_MS);
+		} while (pol_rc < 0 && errno == EINTR);
+
+		if (pol_rc == 0) {
+			LogWarnMsg("Receive timeout: Client failed to send data within the time limit.");
+			return (DFS_FAIL);
+		} else if (pol_rc < 0) {
+			LogSysError("Poll failed during receive operations.", errno);
+			return (DFS_FAIL);
+		}
+
+		ssize_t bytes_read;
+		do {
+			bytes_read = read(fd, ptr, bytes_left);
+		} while (bytes_read < 0 && errno == EINTR);
+
+		if (bytes_read > 0) {
+			ptr += bytes_read;
+			bytes_left -= bytes_read;
+		} else if (bytes_read == 0) {
+			LogEventMsg("Inbound client disconnected gracefully.");
+			return (DFS_FAIL);
+		} else {
+			if (errno != ECONNRESET) {
+				LogSysError("Error reading from inbound socket.", errno);
+			} else {
+				LogErrorMsg("Inbound client connection reset abruptly.");
+			}
+			return (DFS_FAIL);
+		}
+	}
+
+	return (DFS_PASS);
+}
+
+void* outbound_dialer_thread(void* arg)
+{
+	socket_context_t *ctx = (socket_context_t *)arg;
+
+	while (1) {
+		pthread_mutex_lock(&ctx->outbound_sock_fd_lock);
+		int need_connect = (ctx->outbound_sock_fd == -1);
+		pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
+
+		if (need_connect) {
+			reconnect_outbound_socket(ctx);
+		}
+		sleep(RECONNECT_RETRY_DELAY_MS);	// 0.5s
+	}
+	return NULL;
+}
+
+dfs_status_t reconnect_outbound_socket(socket_context_t *ctx)
+{
+	int new_fd = -1;
+	dfs_status_t status = dial_socket(&new_fd, ctx->outbound_socket_path);
+	if (status == DFS_PASS) {
+		pthread_mutex_lock(&ctx->outbound_sock_fd_lock);
+		ctx->outbound_sock_fd = new_fd;
+		LogEventMsg("Outbound socket reconnected successfully.");
+		pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
+	} else {
+		LogErrorMsg("Outbound socket reconnection failed.");
+	}
+
+	return status;
+}
+
+dfs_status_t dial_socket(int *sock_fd_out, const char *socket_path)
 {
 	struct sockaddr_un addr;
 	long flags;
 	int rc;
+	int sock_fd = -1;
 	dfs_status_t status = DFS_FAIL;
 
-	// If an old fd is floating around, purge it cleanly
-	if (ctx->sock_fd != -1) {
-		close(ctx->sock_fd);
-		ctx->sock_fd = -1;
-	}
-
 	// Create raw Unix Stream Socket
-	ctx->sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (ctx->sock_fd < 0) {
+	sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (sock_fd < 0) {
 		LogSysError("Failed to create socket.", errno);
 		return (status);
 	}
 
 	// Force non-blocking mode to apply connect timeout
-	if ((flags = fcntl(ctx->sock_fd, F_GETFL, NULL)) < 0) {
+	if ((flags = fcntl(sock_fd, F_GETFL, NULL)) < 0) {
 		LogSysError("Failed to get socket flags.", errno);
 		goto exit;
 	}
 
-	if (fcntl(ctx->sock_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+	if (fcntl(sock_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
 		LogSysError("Failed to set socket to non-blocking mode.", errno);
 		goto exit;
 	}
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-
-	// Secure string bounds checking for UNIX socket paths
-	strncpy(addr.sun_path, ctx->socket_path, sizeof(addr.sun_path) - 1);
+	strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
 	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 
+#if defined(SO_NOSIGPIPE)
+    int set = 1;
+    setsockopt(sock_fd, SOL_SOCKET, SO_NOSIGPIPE, (void *)&set, sizeof(int));
+#endif
+
 	// Connect
-	rc = connect(ctx->sock_fd, (struct sockaddr *)&addr, sizeof(addr));
+	rc = connect(sock_fd, (struct sockaddr *)&addr, sizeof(addr));
 	if (rc < 0) {
 		if (errno != EINPROGRESS) {
 			LogSysError("Failed to initiate connection.", errno);
@@ -150,18 +322,17 @@ static dfs_status_t socket_connect_internal_locked(socket_context_t *ctx)
 		}
 
 		struct pollfd pfd;
-		pfd.fd = ctx->sock_fd;
+		pfd.fd = sock_fd;
 		pfd.events = POLLOUT;
 
-		// Handle signal interruption loop safely
 		do {
-			rc = poll(&pfd, 1, ctx->connect_timeout_ms);
+			rc = poll(&pfd, 1, DEFAULT_IO_TIMEOUT_MS);
 		} while (rc < 0 && errno == EINTR);
 
 		if (rc <= 0) {
 			if (rc == 0) {
 				LogWarnMsg("Connection attempt timed out after %d ms.",
-					ctx->connect_timeout_ms);
+					DEFAULT_IO_TIMEOUT_MS);
 				errno = ETIMEDOUT;
 			} else {
 				LogSysError("Poll failed during connection.", errno);
@@ -171,8 +342,8 @@ static dfs_status_t socket_connect_internal_locked(socket_context_t *ctx)
 
 		int valopt;
 		socklen_t lon = sizeof(int);
-		if (getsockopt(ctx->sock_fd, SOL_SOCKET, SO_ERROR,
-			       (void *)(&valopt), &lon) < 0) {
+		if (getsockopt(sock_fd, SOL_SOCKET, SO_ERROR,
+					(void *)(&valopt), &lon) < 0) {
 			LogSysError("Failed to get socket options after poll.", errno);
 			goto exit;
 		}
@@ -184,231 +355,121 @@ static dfs_status_t socket_connect_internal_locked(socket_context_t *ctx)
 		}
 	}
 
-	if (fcntl(ctx->sock_fd, F_SETFL, flags) < 0) {
+	// Restore original socket flags
+	if (fcntl(sock_fd, F_SETFL, flags) < 0) {
 		LogSysError("Failed to restore socket flags blocking mode.", errno);
 		goto exit;
 	}
 
+	*sock_fd_out = sock_fd;
 	status = DFS_PASS;
 
 exit:
 	if (status != DFS_PASS) {
 		int saved_errno = errno;
-		if (ctx->sock_fd != -1) {
-			close(ctx->sock_fd);
-			ctx->sock_fd = -1;
+		if (sock_fd != -1) {
+			close(sock_fd);
 		}
 		errno = saved_errno;
 	}
 	return (status);
 }
 
-/**
- * @brief Thread-safe Reconnection routine.
- */
-dfs_status_t socket_reconnect(socket_context_t *ctx)
+ssize_t socket_send_message(int fd, const uint8_t *buffer, size_t len)
 {
-	pthread_mutex_lock(&ctx->lock);
-
-	/* Double-Check Lock Pattern: Verify if another thread recovered link */
-	if (ctx->sock_fd != -1) {
-		struct pollfd pfd;
-		pfd.fd = ctx->sock_fd;
-		pfd.events = POLLOUT;
-
-		// Zero timeout poll check to instantly peek status
-		if (poll(&pfd, 1, 0) >= 0) {
-			int valopt = 0;
-			socklen_t lon = sizeof(int);
-			if (getsockopt(ctx->sock_fd, SOL_SOCKET, SO_ERROR,
-				       (void *)(&valopt), &lon) == 0) {
-				if (valopt == 0) {
-					pthread_mutex_unlock(&ctx->lock);
-					LogInfoMsg(
-						"Connection already recovered by another thread.");
-					return (DFS_PASS);
-				}
-			}
-		}
-		close(ctx->sock_fd);
-		ctx->sock_fd = -1;
+	if (!buffer || len == 0) {
+		return (-EINVAL);
 	}
 
-	LogWarnMsg(
-		"Broken link confirmed. Triggering runtime reconnect sequence...");
-
-	dfs_status_t status = DFS_FAIL;
-	for (int attempt = 0; attempt <= ctx->max_retries; attempt++) {
-		status = socket_connect_internal_locked(ctx);
-		if (status == DFS_PASS) {
-			break;
-		}
-		if (attempt < ctx->max_retries) {
-			pthread_mutex_unlock(&ctx->lock);
-			sleep(ctx->retry_delay_sec);
-			pthread_mutex_lock(&ctx->lock);
-		}
-	}
-
-	pthread_mutex_unlock(&ctx->lock);
-
-	if (status == DFS_PASS) {
-		LogInfoMsg("Runtime reconnect successful");
-		return (DFS_PASS);
-	}
-
-	LogErrorMsg("Runtime reconnection failed completely.");
-	return (DFS_FAIL);
-}
-
-/**
- * @brief Send message routine featuring full tracking for stream partial writes.
- */
-ssize_t socket_send_message(socket_context_t *ctx, const void *buffer,
-			size_t len)
-{
 	struct pollfd pfd;
-	int retry_count = 0;
+	pfd.fd = fd;
+	pfd.events = POLLOUT;
+
 	size_t total_sent = 0;
+	while (total_sent < len) {
+		int pol_rc;
+		do {
+			pol_rc = poll(&pfd, 1, DEFAULT_IO_TIMEOUT_MS);
+		} while (pol_rc < 0 && errno == EINTR);
 
-	if (!ctx || !buffer || len == 0) {
-		return (-EINVAL);
-	}
-
-	while (retry_count <= 1) {
-		pthread_mutex_lock(&ctx->lock);
-		pfd.fd = ctx->sock_fd;
-		pthread_mutex_unlock(&ctx->lock);
-
-		// Disconnected Socket Check & Reconnection
-		if (pfd.fd < 0) {
-			if (socket_reconnect(ctx) != DFS_PASS) {
-				return (-ENOTCONN);
-			}
-			retry_count++;
-			continue;
-		}
-
-		// monitor the socket for POLLOUT
-		pfd.events = POLLOUT;
-		int pol_rc = poll(&pfd, 1, ctx->io_timeout_ms);
 		if (pol_rc == 0) {
-			LogErrorMsg("Send timeout: Backend is frozen or clogged.");
+			LogErrorMsg("Send timeout: Backend socket buffer is frozen or clogged.");
 			return (-ETIMEDOUT);
 		} else if (pol_rc < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			LogSysError("Poll failed during send.", errno);
+			LogSysError("Poll failed during send orchestration.", errno);
 			return (-errno);
 		}
 
-		// Handle partial streaming sends cleanly
-		while (total_sent < len) {
-			ssize_t sent = send(pfd.fd, buffer + total_sent,
-					    len - total_sent, MSG_NOSIGNAL);
-			if (sent < 0) {
-				if (errno == EINTR) {
-					continue;
-				}
-				if (errno == EPIPE || errno == ECONNRESET ||
-				    errno == EBADF) {
-					LogSysError(
-						"Send failed. Attempting self-healing...",
-						errno);
-					if (socket_reconnect(ctx) == DFS_PASS) {
-						retry_count++;
-						break;
-					}
-					return (-ENOTCONN);
-				}
+		ssize_t sent;
+		do {
+			// MSG_NOSIGNAL keeps our process alive if the receiver dies mid-flight
+			sent = send(fd, buffer + total_sent, len - total_sent,
+						MSG_NOSIGNAL);
+		} while (sent < 0 && errno == EINTR);
 
-				LogSysError("Send failed with unrecoverable error.", errno);
-				return (-errno);
+		if (sent < 0) {
+			// If the buffer is temporarily full but socket is non-blocking,
+			// let our loop circle back up to poll() to wait safely.
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				continue; 
 			}
 
-			total_sent += sent;
+			LogSysError("Send system call failed with error.", errno);
+			return (-errno);
 		}
 
-		if (total_sent == len) {
-			return (ssize_t)(total_sent);
-		}
+		total_sent += sent;
 	}
 
-	return (-EIO);
+	return ((ssize_t) total_sent);
 }
 
-/**
- * @brief Robust message reception matching send_message's self-healing mechanics.
- */
-ssize_t socket_recv_message(socket_context_t *ctx, void *buffer, size_t max_len)
-{
-	struct pollfd pfd;
-	int retry_count = 0;
+// void* client_heartbeat_thread(void* arg) {
+// 	socket_context_t *ctx = (socket_context_t *)arg;
 
-	if (!ctx || !buffer || max_len == 0) {
-		return (-EINVAL);
-	}
+// 	while (1) {
+// 		sleep(2);
 
-	while (retry_count <= 1) {
-		pthread_mutex_lock(&ctx->lock);
-		pfd.fd = ctx->sock_fd;
-		pthread_mutex_unlock(&ctx->lock);
+// 		uint8_t* buf = NULL;
+// 		heartbeat_message_t hb = {0};
+// 		heartbeat_message_set_timestamp(&hb, (int64_t)time(NULL));
+		
+// 		int len = heartbeat_message_marshal(&hb, &buf);
+// 		if (len > 0 && buf) {			
+// 			pthread_mutex_lock(&ctx->outbound_sock_fd_lock);
+// 			int sock_fd = ctx->outbound_sock_fd;
+// 			pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
 
-		// Disconnected Socket Check & Reconnection
-		if (pfd.fd < 0) {
-			if (socket_reconnect(ctx) != DFS_PASS) {
-				return (-ENOTCONN);
-			}
-			retry_count++;
-			continue;
-		}
+// 			if (sock_fd == -1) {
+// 				LogWarnMsg("Heartbeat skipped: Outbound socket is disconnected.");
+// 				free(buf);
+// 				heartbeat_message_free(&hb);
+// 				continue;
+// 			}
 
-		// Instead of blocking indefinitely on recv,
-		// use poll to wait for incoming data (POLLIN)
-		pfd.events = POLLIN;
-		int pol_rc = poll(&pfd, 1, ctx->io_timeout_ms);
-		if (pol_rc == 0) {
-			LogWarnMsg("Receive timeout: Backend failed to respond.");
-			return (-ETIMEDOUT);
-		} else if (pol_rc < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
+// 			ssize_t sent = socket_send_message(sock_fd, buf, len);
 
-			LogSysError("Poll failed during receive.", errno);
-			return (-errno);
-		}
+// 			if (sent < 0) {
+// 				LogSysError("Heartbeat send failed with unrecoverable error.", errno);
+				
+// 				pthread_mutex_lock(&ctx->outbound_sock_fd_lock);
+// 				// Double-check it hasn't changed
+// 				if (ctx->outbound_sock_fd == sock_fd) {
+// 					close(ctx->outbound_sock_fd);
+// 					ctx->outbound_sock_fd = -1;
+// 				}
+// 				pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
+// 			} else {
+// 				LogInfoMsg("Heartbeat sent successfully.");
+// 			}
+// 		}
+		
+// 		heartbeat_message_free(&hb);
+// 		free(buf);
+// 	}
 
-		// Data is ready
-		ssize_t bytes_read = recv(pfd.fd, buffer, max_len, 0);
-		if (bytes_read == 0) {
-			LogWarnMsg("Backend closed connection gracefully (EOF).");
-			if (socket_reconnect(ctx) == DFS_PASS) {
-				retry_count++;
-				continue;
-			}
-			return (-ENOTCONN);
-		} else if (bytes_read < 0) {
-			if (errno == EINTR) {
-				continue;
-			}
-			if (errno == ECONNRESET || errno == EBADF) {
-				LogSysError("Backend abruptly reset connection during read.", errno);
-				if (socket_reconnect(ctx) == DFS_PASS) {
-					retry_count++;
-					continue;
-				}
-			}
-			LogSysError("Receive failed with unrecoverable error.", errno);
-			return (-errno);
-		}
-
-		return (bytes_read);
-	}
-
-	return (-EIO);
-}
+// 	return NULL;
+// }
 
 /**
  * @brief Closes the socket context and destroys the lifecycle mutex.
@@ -419,12 +480,27 @@ void socket_close(socket_context_t *ctx)
 		return;
 	}
 
-	pthread_mutex_lock(&ctx->lock);
-	if (ctx->sock_fd != -1) {
-		close(ctx->sock_fd);
-		ctx->sock_fd = -1;
-		LogEventMsg("Socket disconnected and resource closed.");
+	unlink(ctx->inbound_socket_path);
+	close(ctx->inbound_sock_fd);
+	ctx->inbound_sock_fd = -1;
+
+	pthread_mutex_lock(&ctx->outbound_sock_fd_lock);
+	if (ctx->outbound_sock_fd != -1) {
+		close(ctx->outbound_sock_fd);
+		ctx->outbound_sock_fd = -1;
 	}
-	pthread_mutex_unlock(&ctx->lock);
-	pthread_mutex_destroy(&ctx->lock);
+	pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
+	pthread_mutex_destroy(&ctx->outbound_sock_fd_lock);
+
+	if (ctx->inbound_socket_path != NULL) {
+		free(ctx->inbound_socket_path);
+		ctx->inbound_socket_path = NULL;
+	}
+
+	if (ctx->outbound_socket_path != NULL) {
+		free(ctx->outbound_socket_path);
+		ctx->outbound_socket_path = NULL;
+	}
+
+	LogEventMsg("Socket disconnected and resource closed.");
 }
