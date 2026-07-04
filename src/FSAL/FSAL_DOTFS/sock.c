@@ -46,6 +46,22 @@
 dfs_status_t reconnect_outbound_socket(socket_context_t *ctx);
 dfs_status_t dial_socket(int *sock_fd_out, const char *socket_path);
 
+/**
+ * TODO: Do we need multiple Socket per Export:
+ * Let each export open its own UDP socket. This naturally shards the traffic,
+ * splits the kernel locks, and allows different exports to scale across different CPU cores.
+ *
+ * The Ultimate Hotpath Architecture: Direct-Pinned UDS
+ * To achieve the absolute lowest latency possible with Unix Domain Sockets, use a Direct-Pinned Architecture:
+ * 		1. Explicit Paths: Create unique socket files for each worker thread, named explicitly by their core ID (e.g., /run/app.core_0.sock, /run/app.core_1.sock).
+ *		2. CPU Pinning (Affinity): Use sched_setaffinity (or taskset) to pin each worker process/thread to a specific physical CPU core.
+ *   	3. Client-Side Routing: Have the client decide which core to talk to before sending. The client can use a simple thread-local counter (Round Robin)
+ *			or map its own thread ID to the corresponding worker socket path
+ *
+ *	https://medium.com/@sanskaragr.14/trading-at-light-speed-how-exchanges-process-orders-with-microsecond-latency-part-1-2c70e748c984
+ *  https://goperf.dev/02-networking/low-level-optimizations/
+ */
+
 dfs_status_t initialize_socket_ctx(socket_context_t *ctx)
 {
 	LogInfoMsg("Inbound socket file: %s", ctx->inbound_socket_path);
@@ -375,6 +391,7 @@ exit:
 	return (status);
 }
 
+// Must be called with the outbound_sock_fd_lock held if you want to ensure thread safety.
 ssize_t socket_send_message(int fd, const uint8_t *buffer, size_t len)
 {
 	if (!buffer || len == 0) {
@@ -438,9 +455,8 @@ ssize_t socket_send_message(int fd, const uint8_t *buffer, size_t len)
 // 		if (len > 0 && buf) {			
 // 			pthread_mutex_lock(&ctx->outbound_sock_fd_lock);
 // 			int sock_fd = ctx->outbound_sock_fd;
-// 			pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
-
 // 			if (sock_fd == -1) {
+// 				pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
 // 				LogWarnMsg("Heartbeat skipped: Outbound socket is disconnected.");
 // 				free(buf);
 // 				heartbeat_message_free(&hb);
@@ -448,6 +464,7 @@ ssize_t socket_send_message(int fd, const uint8_t *buffer, size_t len)
 // 			}
 
 // 			ssize_t sent = socket_send_message(sock_fd, buf, len);
+// 			pthread_mutex_unlock(&ctx->outbound_sock_fd_lock);
 
 // 			if (sent < 0) {
 // 				LogSysError("Heartbeat send failed with unrecoverable error.", errno);

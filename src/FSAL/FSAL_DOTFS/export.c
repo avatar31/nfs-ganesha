@@ -21,41 +21,144 @@
  * -------------
  */
 
+#include "fsal_convert.h"
+#include "FSAL/fsal_commonlib.h"
+#include "FSAL/fsal_config.h"
+#include "FSAL/fsal_localfs.h"
+
 #include "dotfs.h"
 
+void dotfs_export_ops_init(struct export_ops *ops);
+static void dotfs_export_release(struct fsal_export *exp_hdl);
+fsal_status_t dotfs_export_lookup_path(struct fsal_export *exp_hdl, const char *path,
+			      struct fsal_obj_handle **obj_hdl,
+			      struct fsal_attrlist *attrs_out);
+static fsal_status_t dotfs_export_wire_to_host(struct fsal_export *exp_hdl,
+					fsal_digesttype_t in_type,
+					struct gsh_buffdesc *fh_desc, int flags);
+fsal_status_t dotfs_export_create_handle(struct fsal_export *exp_hdl,
+				  struct gsh_buffdesc *hdl_desc,
+				  struct fsal_obj_handle **obj_hdl,
+				  struct fsal_attrlist *attrs_out);
+static fsal_status_t dotfs_export_get_fs_dynamic_info(struct fsal_export *exp_hdl,
+				      struct fsal_obj_handle *obj_hdl,
+				      fsal_dynamicfsinfo_t *infop);
+static attrmask_t dotfs_export_fs_supported_attrs(struct fsal_export *exp_hdl);
+static struct state_t *dotfs_export_alloc_state(struct fsal_export *exp_hdl,
+					 enum state_type state_type,
+					 struct state_t *related_state);
+void dotfs_export_get_fsal_obj_hdl(struct fsal_export *exp_hdl, struct fsal_fd *fd,
+		      struct fsal_obj_handle **handle);
+static void dotfs_close_ctx(dotfs_context_t *ctx);
+
+
+static struct config_item export_params[] = {
+    CONF_ITEM_NOOP("name"),
+	CONFIG_EOL
+};
+
+static struct config_block export_param = {
+	.dbus_interface_name = "org.ganesha.nfsd.config.fsal.dotfs-export",
+	.blk_desc.name = "FSAL",
+	.blk_desc.type = CONFIG_BLOCK,
+	.blk_desc.u.blk.init = noop_conf_init,
+	.blk_desc.u.blk.params = export_params,
+	.blk_desc.u.blk.commit = noop_conf_commit
+};
+
+
 /**
- * dotfs_create_export — create and register a new DOTFS export.
+ * @brief Create and register a new DOTFS export.
  *
- * Entry point invoked by Ganesha's export manager when it processes an
- * export configuration block whose FSAL is DOTFS.  Steps:
+ * Invoked by Ganesha's daemon engine during initialization or reloads. This function allocates 
+ * the memory block for the DOTFS export, parses parameters, and assigns the structural 
+ * operational vectors.
+ *
+ * Steps:
  *   1. Parse DOTFS-specific config from @p parse_node.
- *   2. Allocate and zero a dotfs_fsal_export.
+ *   2. Allocate and zero a dotfs_fsal_export_t.
  *   3. Open the dotfs VFS context for the export path.
  *   4. Register the export ops table with Ganesha.
  *   5. Attach to the FSAL module's export list.
  *
- * @param[in] fsal_hdl   The DOTFS fsal_module singleton.
- * @param[in] parse_node Opaque config parse node for this export block.
- * @param[in] err_type   Error accumulator for config parse errors.
- * @param[in] up_ops     Upcall vector (cache invalidation, layout recalls).
+ * @param[in]  fsal_hdl   Pointer to the master FSAL module parent structure.
+ * @param[in]  parse_node Configuration parsing node handle representing the current block.
+ * @param[out] err_type   Buffer utilized to report configuration compilation faults.
+ * @param[in]  up_ops     Upper layer up-call function vector table mappings.
  *
- * @return FSAL_NO_ERROR on success; ERR_FSAL_NOMEM / ERR_FSAL_INVAL on error.
+ * @return fsal_status_t  Returns ERR_FSAL_NO_ERROR on a clean setup or mapped POSIX errors.
  */
 fsal_status_t dotfs_create_export(struct fsal_module *fsal_hdl,
 				  void *parse_node,
 				  struct config_error_type *err_type,
 				  const struct fsal_up_vector *up_ops)
 {
-    // TODO: implement this function.  Example steps:
-    //   1. Parse the per-export DOTFS config block (e.g. export path, ACL policy, etc.) from @p parse_node.
-    //   2. Allocate and zero a dotfs_fsal_export structure.
-    //   3. Open the dotfs VFS context for the export path (e.g. by calling a dotfs_open_vfs_ctx() function in the dotfs C-binding).
-    //   4. Register the export ops table with Ganesha (e.g. by setting myself->export.exp_ops.release = dotfs_release_export, etc.).
-    //   5. Attach to the FSAL module's export list (e.g. by calling fsal_attach_export()).
-    //   6. Return FSAL_NO_ERROR on success, or an appropriate error code on failure.
-
+    dotfs_fsal_export_t *myself = NULL;
+    int rc = 0;
     fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
+
+    LogInfoMsg("Creating new DOTFS export");
+
+    // TODO: Do we need AVL tree to maintain the list of exports?
+    // vfs_state_init();
+
+    myself = gsh_calloc(1, sizeof(dotfs_fsal_export_t));
+
+    fsal_export_init(&myself->export);
+    dotfs_export_ops_init(&myself->export.exp_ops);
+    myself->export.up_ops = up_ops;
+
+    dotfs_fsal_module_t *dotfs_module =
+		container_of(fsal_hdl, dotfs_fsal_module_t, module);
+    myself->shared_sock_ctx = &dotfs_module->sock_ctx;
+
+    rc = load_config_from_node(parse_node, &export_param, myself,
+				       true, err_type);
+	if (rc != 0) {
+		status = posix2fsal_status(EINVAL);
+		goto err_free;
+	}
+
+    myself->export.fsal = fsal_hdl;
+
+    rc = fsal_attach_export(fsal_hdl, &myself->export.exports);
+	if (rc != 0) {
+		status = posix2fsal_status(rc);
+		goto err_cleanup;
+	}
+
+    op_ctx->fsal_export = &myself->export;
+
+    // LogEventMsg("[DotFS] Export %u created and attached successfully for path: %s", 
+    //             myself->export_id, myself->export_path);
+    LogEventMsg("Export created and attached successfully for path: %s", 
+                myself->export_path);
+    return fsalstat(ERR_FSAL_NO_ERROR, 0);
+
+err_cleanup:
+	unclaim_all_export_maps(&myself->export);
+	fsal_detach_export(fsal_hdl, &myself->export.exports);
+err_free:
+	free_export_ops(&myself->export);
+	gsh_free(myself); /* elvis has left the building */
     return status;
+}
+
+/**
+ * dotfs_export_ops_init — initialize the DOTFS export ops table.
+ * 
+ * @param[in,out] ops Pointer to the export ops table to initialize.
+ */
+void dotfs_export_ops_init(struct export_ops *ops)
+{
+    ops->release                = dotfs_export_release;
+    ops->lookup_path            = dotfs_export_lookup_path;
+    ops->wire_to_host           = dotfs_export_wire_to_host;
+    ops->create_handle          = dotfs_export_create_handle;
+    ops->get_fs_dynamic_info    = dotfs_export_get_fs_dynamic_info;
+    ops->fs_supported_attrs     = dotfs_export_fs_supported_attrs;
+    ops->alloc_state            = dotfs_export_alloc_state;
+    ops->get_fsal_obj_hdl       = dotfs_export_get_fsal_obj_hdl;
 }
 
 /**
@@ -91,4 +194,323 @@ fsal_status_t dotfs_update_export(struct fsal_module *fsal_hdl,
 
     fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
     return status;
+}
+
+/**
+ * @brief Destructor for the custom FSAL export instance.
+ *
+ * Invoked when Ganesha is done with an export and wants to free its resources.
+ * It performs complete cleanup of backend storage links, local structures,
+ * and memory resources.
+ *
+ * @param[in] exp_hdl Pointer to the generic Ganesha fsal_export structure.
+ */
+static void dotfs_export_release(struct fsal_export *exp_hdl)
+{
+    dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
+
+    // TODO: Change this to debug log
+    LogInfoMsg("Releasing DOTFS export %" PRIu16 " path=%s",
+		 exp_hdl->export_id, myself->root_path ? myself->root_path : "(null)");
+
+	/* TODO: flush in-flight I/O before closing the VFS context. */
+    
+    dotfs_close_ctx(myself->dotfs_ctx);
+    myself->dotfs_ctx = NULL;
+    
+    gsh_free(myself->root_path);
+	myself->root_path = NULL;
+
+	/* Detach from Ganesha's export registry and free export ops. */
+    fsal_detach_export(exp_hdl->fsal, &exp_hdl->exports);
+	free_export_ops(exp_hdl);
+
+    gsh_free(myself); /* elvis has left the building */
+    myself = NULL;
+}
+
+/**
+ * @brief Resolves a configuration path into a root object handle and fetches its attributes.
+ *
+ * Invoked during export initialization. This function translates the human-readable 
+ * configuration path into an internal FSAL object handle representing the export's root, 
+ * while simultaneously retrieving its initial metadata attributes.
+ *
+ * @param[in]  exp_hdl    Pointer to the generic Ganesha export structure.
+ * @param[in]  path       The configuration path string to be resolved.
+ * @param[out] handle     Pointer to store the newly allocated root object handle.
+ * @param[out] attrs_out  Pointer to store the root object's initial metadata attributes.
+ * 
+ * @return fsal_status_t  Returns success status or an appropriate FSAL error code.
+ */
+fsal_status_t dotfs_export_lookup_path(struct fsal_export *exp_hdl, const char *path,
+			      struct fsal_obj_handle **obj_hdl,
+			      struct fsal_attrlist *attrs_out)
+{
+    LogInfoMsg("Resolving path '%s' for export", path);
+
+    dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
+	// struct fsal_attrlist attrs;
+    // dotfs_fsal_obj_handle_t *obj_handle = NULL;
+    // fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
+
+    // dotfs_file_handle_t *file_handle = NULL;
+
+    // TODO: Remove me
+    LogInfoMsg("Export path is '%s', requested path is '%s'", myself->export_path, path);
+    
+    // if (strcmp(path, myself->export_path) != 0) {
+	// 	/* Lookup of a path other than the export's root. */
+	// 	LogErrorMsg("Attempt to lookup non-root path %s", path);
+	// 	return fsalstat(ERR_FSAL_NOENT, ENOENT);
+	// }
+
+    // High-Level Logic: What your implementation must do
+    // When Ganesha invokes your myfs_lookup_path, your code will typically follow these steps:
+    //      1. Sanity Check & Context: Upcast exp_hdl to your private structure. 
+    //         Verify the incoming path string isn't null or empty.
+    //      2. Backend Query: Tell your custom storage backend, "Hey, look up the folder
+    //         located at path. Give me its internal ID/Inode and its current permissions."
+    //      3. Handle Allocation: Allocate memory for your custom object handle (which wraps
+    //         struct fsal_obj_handle).
+    //      4. Populate Handle: Fill it with the backend ID and assign your object operations
+    //         (fsal_obj_ops) to it.
+    //      5. Populate Attributes: Fill the attrs_out structure with the backend permissions
+    //         (e.g., owner, group, mode 0755).
+    //      6. Return: Set *handle = &your_new_handle->obj_handle; and return status_success().
+    return fsalstat(ERR_FSAL_NOTSUPP, 0);
+}
+
+/**
+ * @brief Reconstructs an internal object handle from a raw network file handle.
+ *
+ * Invoked when an NFS client sends an existing file handle over the network. 
+ * This function decodes the raw byte descriptor into a valid, in-memory 
+ * FSAL object handle, allowing Ganesha to perform active I/O operations on it.
+ *
+ * @param[in]  exp_hdl     Pointer to the generic Ganesha export structure.
+ * @param[in]  handle_desc Pointer to the raw byte buffer received from the wire.
+ * @param[out] obj_hdl     Pointer to store the reconstructed FSAL object handle.
+ * @param[out] attrs_out   Pointer to store the object's initial metadata attributes.
+ * 
+ * @return fsal_status_t   Returns success status or an appropriate FSAL error code.
+ */
+fsal_status_t dotfs_export_create_handle(struct fsal_export *exp_hdl,
+				  struct gsh_buffdesc *hdl_desc,
+				  struct fsal_obj_handle **obj_hdl,
+				  struct fsal_attrlist *attrs_out)
+{
+    LogInfoMsg("Reconstructing object handle from raw descriptor");
+
+    // High-Level Logic: What your implementation must do
+    // When Ganesha invokes your myfs_create_handle, your code will typically follow these steps:
+    //      1. Extract Custom Data: Cast handle_desc->addr into your FSAL's internal identifier structure (e.g., an inode wrapper or database UUID).
+    //      2. Sanity Check: Ensure the handle data is valid and actually belongs to this export.
+    //      3. Check Cache / Allocate: Check if your FSAL already has this object active in memory. If not, allocate memory for your custom object handle structure.
+    //      4. Reconstruct: Re-link the handle to your storage backend using the unique ID decoded from the bytes.
+    //      5. Set Operations: Assign file or directory operations (fsal_obj_ops) to this newly resurrected handle so Ganesha knows how to read/write to it.
+    //      6. Return: Assign the output pointer and return ERR_FSAL_NO_ERROR.
+
+	return fsalstat(ERR_FSAL_NOTSUPP, 0);
+}
+
+/**
+ * @brief Translates an opaque network file handle (wire) into a live memory object (host).
+ *
+ * This handler acts as the decoder for incoming network requests. It takes a raw, 
+ * serialized byte array sent by an NFS client, extracts the backend storage 
+ * identifiers, and hooks them back into a live in-memory FSAL handle structure.
+ *
+ * @param[in]  exp_hdl     Pointer to the generic Ganesha export structure.
+ * @param[in]  wire_buf    The raw byte descriptor received directly from the network packet.
+ * @param[out] host_handle Pointer to store the reconstructed, live memory object handle.
+ * @param[out] attrs_out   Pointer to store the object's metadata attributes retrieved during lookup.
+ * 
+ * @return fsal_status_t   Returns success status or an appropriate FSAL error code.
+ */
+static fsal_status_t dotfs_export_wire_to_host(struct fsal_export *exp_hdl,
+					fsal_digesttype_t in_type,
+					struct gsh_buffdesc *fh_desc, int flags)
+{
+    // High-Level Logic: What your implementation must do
+    // When Ganesha invokes your myfs_wire_to_host, your code will typically follow these steps:
+    //      1. Decode: Interpret the raw bytes in fh_desc->addr according to your FSAL's wire format. This may involve deserializing a struct or extracting a unique identifier.
+    //      2. Validate: Ensure the decoded identifier is valid and corresponds to an object in your backend storage. If not, return an error.
+    //      3. Lookup: Use the decoded identifier to query your backend storage and retrieve the corresponding object. This may involve checking a database, filesystem, or other storage mechanism.
+    //      4. Allocate Handle: If the object is found, allocate memory for your custom FSAL object handle structure and populate it with the retrieved information.
+    //      5. Set Operations: Assign the appropriate fsal_obj_ops to the newly created handle so Ganesha knows how to perform operations on it.
+    //      6. Return: Assign the output pointer and return ERR_FSAL_NO_ERROR if successful, or an appropriate error code if any step fails.
+    // 
+    // Critical Rules for Writing a Wire-to-Host Handler:
+    //      1. Never Trust the Wire: The incoming byte array comes from the network. Always validate that the handle size matches what your FSAL expects before casting it, otherwise a malicious or broken client could cause a buffer overflow.
+    //      2. Be Fast: This function is in the hot path of almost every disconnected NFS request. Keep your wire-decoding math lightweight.
+
+    LogInfoMsg("Translating wire handle to host object");
+
+	return fsalstat(ERR_FSAL_NOTSUPP, 0);
+}
+
+/**
+ * @brief Retrieves dynamic file system statistics like total, free, and available space.
+ *
+ * Invoked when an NFS client requests disk usage statistics (e.g., via the 'df' command).
+ * This function queries the custom storage backend for its current capacity, free space, 
+ * and inode utilization, filling out Ganesha's dynamic info structure.
+ *
+ * @param[in]  exp_hdl    Pointer to the generic Ganesha export structure.
+ * @param[in]  obj_hdl    Pointer to the object handle used to anchor the query.
+ * @param[out] info       Pointer to the structure where storage space stats must be saved.
+ * 
+ * @return fsal_status_t  Returns success status or an appropriate FSAL error code.
+ */
+static fsal_status_t dotfs_export_get_fs_dynamic_info(struct fsal_export *exp_hdl,
+				      struct fsal_obj_handle *obj_hdl,
+				      fsal_dynamicfsinfo_t *info)
+{
+    LogInfoMsg("Fetching dynamic filesystem statistics");
+
+    // dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
+    // struct myfs_backend_stats stats;
+    // int rc;
+
+    // /* Step 1: Sanity checks and upcasting */
+    // if (exp_hdl == NULL || info == NULL) {
+    //     return fsalstat(ERR_FSAL_FAULT, EINVAL);
+    // }
+
+    // /* Step 2: Query your backend storage for its raw numbers */
+    // rc = myfs_backend_query_space(myself->dotfs_ctx, &stats);
+    // if (rc != 0) {
+    //     LogCrit(COMPONENT_FSAL, "Failed to retrieve backend storage statistics");
+    //     return fsalstat(ERR_FSAL_IO, EIO);
+    // }
+
+    // /* 
+    //  * Step 3: Populate the Ganesha structure.
+    //  * Translate your storage block architecture into raw bytes.
+    //  */
+    // info->total_bytes = (uint64_t)stats.total_blocks * stats.block_size;
+    // info->free_bytes  = (uint64_t)stats.free_blocks  * stats.block_size;
+    
+    // /* 
+    //  * avail_bytes represents space usable by unprivileged users. 
+    //  * If your backend doesn't have reserved root blocks, set it equal to free_bytes.
+    //  */
+    // info->avail_bytes = (uint64_t)stats.available_blocks * stats.block_size;
+
+    // /* Map backend inode tracking metrics */
+    // info->total_files = stats.total_inodes;
+    // info->free_files  = stats.free_inodes;
+
+    // /* 
+    //  * Set file timestamp granularity. 
+    //  * E.g., 1 = 1-second resolution, 1000000000 = nanosecond resolution.
+    //  */
+    // info->time_delta.tv_sec = 0;
+    // info->time_delta.tv_nsec = 1; /* Nanosecond precision */
+
+    return fsalstat(ERR_FSAL_NOTSUPP, 0);
+}
+
+/**
+ * @brief Reports the total metadata attribute capabilities supported by this export.
+ *
+ * Invoked during export initialization or capability inspection. This function returns 
+ * an optimized attrmask_t structure outlining every file attribute your backend 
+ * storage volume can successfully read or modify.
+ *
+ * @param[in]  exp_hdl    Pointer to the generic Ganesha export structure.
+ * 
+ * @return attrmask_t     The finalized mask of all active attribute bits.
+ */
+static attrmask_t dotfs_export_fs_supported_attrs(struct fsal_export *exp_hdl)
+{
+    attrmask_t supported_mask;
+
+    LogInfoMsg("Reporting supported metadata attributes for export");
+
+    supported_mask = fsal_supported_attrs(&exp_hdl->fsal->fs_info);
+	// supported_mask &= ~ATTR_ACL;
+
+    return supported_mask;
+}
+
+void dotfs_export_free_state(struct state_t *state)
+{
+	dotfs_fd_t *my_fd;
+	my_fd = &container_of(state, dotfs_state_fd_t, state)->dotfs_fd;
+
+	destroy_fsal_fd(&my_fd->fsal_fd);
+	gsh_free(state);
+}
+
+/**
+ * @brief Allocates the memory wrapper used to track active NFSv4 file opens and locks.
+ *
+ * Invoked whenever an NFS client performs a stateful operation (like opening a file or 
+ * requesting a file lock). This function allocates your FSAL's custom state structure, 
+ * helping the server remember and enforce open/lock ownership.
+ *
+ * @param[in]  exp_hdl      Pointer to the generic Ganesha export structure.
+ * @param[in]  state_type   The nature of the state (e.g., File Open, Record Lock).
+ * @param[in]  parent_state Link to the parent state block (useful for mapping locks to opens).
+ * 
+ * @return struct fsal_state*  Pointer to Ganesha's core tracking state object inside your wrapper.
+ */
+static struct state_t *dotfs_export_alloc_state(struct fsal_export *exp_hdl,
+					 enum state_type state_type,
+					 struct state_t *related_state)
+{
+    struct state_t *state;
+	dotfs_fd_t *my_fd;
+
+    LogInfoMsg("Allocating state for type %d", state_type);
+
+	state = init_state(gsh_calloc(1, sizeof(dotfs_state_fd_t)),
+			   dotfs_export_free_state, state_type, related_state);
+
+	my_fd = &container_of(state, dotfs_state_fd_t, state)->dotfs_fd;
+
+    // TODO: What is op_ctx->fsal_export here?
+	init_fsal_fd(&my_fd->fsal_fd, FSAL_FD_STATE, op_ctx->fsal_export);
+
+	return state;
+}
+
+/**
+ * @brief Resolves an active file descriptor back into its corresponding object handle.
+ *
+ * Invoked internally by Ganesha's execution layers. Given an open file descriptor 
+ * structure (fsal_fd), this function maps it back to its underlying tracking 
+ * object handle structure, updating the provided handle pointer directly.
+ *
+ * @param[in]  exp_hdl  Pointer to the generic Ganesha export structure.
+ * @param[in]  fd       Pointer to the active file descriptor structure being mapped.
+ * @param[out] handle   Pointer to store the resolved object handle destination.
+ */
+void dotfs_export_get_fsal_obj_hdl(struct fsal_export *exp_hdl, struct fsal_fd *fd,
+		      struct fsal_obj_handle **handle)
+{
+    LogInfoMsg("Retrieving FSAL object handle from file descriptor");
+
+    dotfs_fd_t *my_fd = NULL;
+    dotfs_fsal_obj_handle_t *myself = NULL;
+
+    my_fd = container_of(fd, dotfs_fd_t, fsal_fd);
+    myself = container_of(my_fd, dotfs_fsal_obj_handle_t, u.file.fd);
+
+    *handle = &myself->obj_handle;
+}
+
+/**
+ * dotfs_close_ctx — release a previously created dotfs context.
+ *
+ * @param[in] ctx  context returned by dotfs_open_ctx().
+ */
+static void dotfs_close_ctx(dotfs_context_t *ctx)
+{
+    // TODO: Implement the actual context cleanup logic here
+    // such as closing file descriptors, freeing memory, 
+    // and releasing any other resources associated with the context.
+	(void)ctx;
 }

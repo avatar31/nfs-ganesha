@@ -100,6 +100,11 @@ typedef struct {
 	pthread_mutex_t outbound_sock_fd_lock;
 } socket_context_t;
 
+// TODO: Do we need this?
+typedef struct {
+
+} dotfs_context_t;
+
 /* ---------------------------------------------------------------------------
  * Module-level private storage
  *
@@ -146,7 +151,7 @@ typedef struct {
  * ------------------------------------------------------------------------- */
 
 typedef struct {
-	/** NFSv4 open-state — MUST be first member. */
+	/** NFSv4 open-state*/
 	struct state_t state;
 	/** The underlying fd for this state. */
 	dotfs_fd_t dotfs_fd;
@@ -158,14 +163,14 @@ typedef struct {
 	uint8_t handle_data[DOTFS_HANDLE_MAX_LEN];
 	/** Actual length of valid bytes in handle_data. */
 	uint16_t handle_len;
-} dotfs_obj_handle_t;
+} dotfs_file_handle_t;
 
 typedef struct {
-	/** Ganesha generic object handle — MUST be first member. */
+	/** Ganesha generic object handle */
 	struct fsal_obj_handle obj_handle;
 
-	/** Serialised dotfs object handle used as a stable NFS FH payload. */
-	dotfs_obj_handle_t handle;
+	/** Serialised dotfs file handle used as a stable NFS FH payload. */
+	dotfs_file_handle_t handle;
 
 	/** Upcall vector for cache invalidation / layout recalls. */
 	const struct fsal_up_vector *up_ops;
@@ -206,6 +211,29 @@ typedef struct {
 /* ---------------------------------------------------------------------------
  * Module / export lifecycle  (export.c)
  * ------------------------------------------------------------------------- */
+
+typedef struct {
+	/** Ganesha generic export handle */
+	struct fsal_export export;
+
+	/**
+	 * Root path inside the dotfs namespace that this export exposes.
+	 * Allocated on export creation; freed in dotfs_export_release().
+	 */
+	char *root_path;
+	// dotfs_fsal_obj_handle_t *root_handle;
+
+	char *export_path;
+
+	/**
+	 * Opaque handle to the dotfs VFS context (Go-layer handle).
+	 * Lifetime: created in dotfs_create_export(), closed in
+	 * dotfs_export_release().
+	 */
+	dotfs_context_t *dotfs_ctx;
+
+	socket_context_t *shared_sock_ctx;
+} dotfs_fsal_export_t;
 
 /**
  * @brief Create a new dotfs export instance.

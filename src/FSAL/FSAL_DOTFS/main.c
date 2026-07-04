@@ -84,22 +84,21 @@ static dotfs_fsal_module_t DOTFS = {
  * ========================================================================= */
 
 static struct config_item dotfs_params[] = {
-	// Assuming file is already created by systemd
-	// CONF_ITEM_STR("socket_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
-	// 	      sock_ctx.inbound_socket_path),
-	// CONF_ITEM_STR("fs_socket_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
-	// 	      sock_ctx.outbound_socket_path),
+	CONF_ITEM_STR("inbound_sock_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
+		      sock_ctx.inbound_socket_path),
+	CONF_ITEM_STR("outbound_sock_path", 1, SOCK_PATH_MAX, "", dotfs_fsal_module,
+		      sock_ctx.outbound_socket_path),
 	CONFIG_EOL
 };
 
 struct config_block dotfs_param_block = {
 	.dbus_interface_name = "org.ganesha.nfsd.config.fsal.dotfs",
-	.blk_desc.name = "DOTFS",
-	.blk_desc.type = CONFIG_BLOCK, // TODO: What is this field for?
-	.blk_desc.flags = CONFIG_UNIQUE, // TODO: What is this field for?
-	.blk_desc.u.blk.init = noop_conf_init, // TODO: What is this field for?
-	.blk_desc.u.blk.params = dotfs_params, // TODO: What is this field for?
-	.blk_desc.u.blk.commit = noop_conf_commit // TODO: What is this field for?
+	.blk_desc.name = "DOTFS",			// Block name in ganesha.conf
+	.blk_desc.type = CONFIG_BLOCK, 		// Standalone block with key/value pairs
+	.blk_desc.flags = CONFIG_UNIQUE,	// Only one DOTFS block allowed in ganesha.conf
+	.blk_desc.u.blk.init = noop_conf_init,
+	.blk_desc.u.blk.params = dotfs_params,
+	.blk_desc.u.blk.commit = noop_conf_commit
 };
 
 /**
@@ -112,38 +111,13 @@ static dfs_status_t init_sock(dotfs_fsal_module_t *dotfs_module)
 {
 	pthread_t in_tid, out_tid;
 
-	// TODO: Is this possible?
-	// strncpy(dotfs_module->sock_ctx.inbound_socket_path,
-	// 	dotfs_param_block.blk_desc.u.blk.params[0].u.str_val,
-	// 	SOCK_PATH_MAX);
-	// strncpy(dotfs_module->sock_ctx.outbound_socket_path,
-	// 	dotfs_param_block.blk_desc.u.blk.params[1].u.str_val,
-	// 	SOCK_PATH_MAX);
-
-	dotfs_module->sock_ctx.inbound_socket_path = strdup("/var/run/dotfs/ganesha.sock");
-	if (dotfs_module->sock_ctx.inbound_socket_path == NULL) {
-		LogErrorMsg("Failed to allocate memory for inbound socket path");
-		return (DFS_FAIL);
-	}
-
-    dotfs_module->sock_ctx.outbound_socket_path = strdup("/var/run/dotfs/dotfs.sock");
-	if (dotfs_module->sock_ctx.outbound_socket_path == NULL) {
-		LogErrorMsg("Failed to allocate memory for outbound socket path");
-		free(dotfs_module->sock_ctx.inbound_socket_path);
-		return (DFS_FAIL);
-	}
-
 	if (initialize_socket_ctx(&dotfs_module->sock_ctx) != DFS_PASS) {
 		LogErrorMsg("Failed to initialize socket context");
-		free(dotfs_module->sock_ctx.inbound_socket_path);
-		free(dotfs_module->sock_ctx.outbound_socket_path);
 		return (DFS_FAIL);
 	}
 
 	if (init_inbound_server(&dotfs_module->sock_ctx) != DFS_PASS) {
         LogErrorMsg("Failed to initialize inbound socket interface. Aborting startup.");
-		free(dotfs_module->sock_ctx.inbound_socket_path);
-		free(dotfs_module->sock_ctx.outbound_socket_path);
         return (DFS_FAIL);
     }
 
@@ -151,8 +125,6 @@ static dfs_status_t init_sock(dotfs_fsal_module_t *dotfs_module)
 		LogSysError("Failed to create inbound reader thread", errno);
 		close(dotfs_module->sock_ctx.inbound_sock_fd);
         unlink(dotfs_module->sock_ctx.inbound_socket_path);
-		free(dotfs_module->sock_ctx.inbound_socket_path);
-		free(dotfs_module->sock_ctx.outbound_socket_path);
 		return (DFS_FAIL);
 	}
 	pthread_detach(in_tid);
@@ -161,8 +133,6 @@ static dfs_status_t init_sock(dotfs_fsal_module_t *dotfs_module)
 		LogSysError("Failed to create inbound reader thread", errno);
 		close(dotfs_module->sock_ctx.inbound_sock_fd);
         unlink(dotfs_module->sock_ctx.inbound_socket_path);
-		free(dotfs_module->sock_ctx.inbound_socket_path);
-		free(dotfs_module->sock_ctx.outbound_socket_path);
 		return (DFS_FAIL);
 	}
     pthread_detach(out_tid);
