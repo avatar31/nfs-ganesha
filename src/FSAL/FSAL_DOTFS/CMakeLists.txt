@@ -25,13 +25,15 @@ add_definitions(
 )
 
 set(fsaldotfs_LIB_SRCS
-  main.c
+  dotfs.h
   export.c
   handle.c
-  sock.c
+  helpers.c
+  main.c
   messages.c
   messages.h
-  dotfs.h
+  sock.c
+  storage.c
 )
 
 add_library(fsaldotfs MODULE ${fsaldotfs_LIB_SRCS})

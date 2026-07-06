@@ -21,9 +21,12 @@
  * -------------
  */
 
+#include "fsal_convert.h"
+#include "FSAL/fsal_config.h"
 #include "FSAL/fsal_commonlib.h"
 
 #include "dotfs.h"
+
 
 /**
  * dotfs_handle_ops_init — populate the fsal_obj_ops table for DOTFS.
@@ -140,32 +143,66 @@ fsal_status_t dotfs_merge(struct fsal_obj_handle *orig_hdl,
  *       handle with dotfs_alloc_handle(), populate attrs_out.
  */
 fsal_status_t dotfs_lookup(struct fsal_obj_handle *parent, const char *name,
-			   struct fsal_obj_handle **handle,
-			   struct fsal_attrlist *attrs_out)
+							struct fsal_obj_handle **handle,
+			   				struct fsal_attrlist *attrs_out)
 {
-	/* TODO:
-	 *   dotfs_fsal_obj_handle_t *parent_hdl = DOTFS_OBJ(parent);
-	 *   struct dotfs_fsal_export *exp = DOTFS_EXPORT(op_ctx->ctx_export->fsal_export);
-	 *   char child_path[PATH_MAX];
-	 *   snprintf(child_path, sizeof(child_path), "%s/%s",
-	 *            parent_path_from_handle(parent_hdl), name);
-	 *   ObjectStorageMeta *meta = dotfs_meta_get(exp->dotfs_ctx, child_path);
-	 *   if (!meta) return fsalstat(ERR_FSAL_NOENT, 0);
-	 *   dotfs_fsal_obj_handle_t *hdl =
-	 *       dotfs_alloc_handle(exp, build_fh(meta), meta->type, NULL, child_path);
-	 *   *handle = &hdl->obj_handle;
-	 */
-	(void)parent;
-    (void)name;
+	fsal_status_t status = {ERR_FSAL_NO_ERROR, 0};
+    dotfs_fsal_obj_handle_t *my_parent = NULL;
+    struct fsal_obj_handle *new_fsal_obj_hdl = NULL;
 
-    if (handle != NULL) {
-        *handle = NULL;
-    }
-    if (attrs_out != NULL) {
-        memset(attrs_out, 0, sizeof(struct fsal_attrlist));
+	if (!parent || !name || !handle || !attrs_out) {
+        return fsalstat(ERR_FSAL_FAULT, 0);
     }
 
-	return fsalstat(ERR_FSAL_NOTSUPP, 0);
+	my_parent = container_of(parent, dotfs_fsal_obj_handle_t, fsal_handle);
+    *handle = NULL;
+
+	if (strcmp(name, "..") == 0 && my_parent->type == HANDLE_TYPE_EXPORT_ROOT) {
+		// The client is at the export root and trying to go higher. Force them to stay right here.
+		parent->obj_ops->get_ref(parent);
+		*handle = parent;
+		status = parent->obj_ops->getattrs(parent, attrs_out);
+	
+		return (status);
+	}
+
+	LogInfoMsg("lookup for name '%s' in parent %s", name, my_parent->object_key);
+
+	switch (my_parent->type) {
+		case HANDLE_TYPE_GLOBAL_ROOT:
+			parent->obj_ops->get_ref(parent);
+			*handle = parent;
+			status = parent->obj_ops->getattrs(parent, attrs_out);
+
+			return (status);
+		case HANDLE_TYPE_EXPORT_ROOT:
+			status = storage_export_lookup(my_parent, name, &new_fsal_obj_hdl);
+			break;
+		case HANDLE_TYPE_REGULAR_FILE_OR_DIR:
+			/* 
+             * Every subsequent lookup request is now a standard file or directory 
+             * query directed strictly to storage backend service.
+             */
+			status = storage_file_or_dir_lookup(my_parent, name, &new_fsal_obj_hdl);
+			break;
+		default:
+			LogErrorMsg("Encountered unknown object type: %d", my_parent->type);
+            status = fsalstat(ERR_FSAL_SERVERFAULT, 0);
+            break;
+	}
+
+	if (FSAL_IS_SUCCESS(status) && new_fsal_obj_hdl) {
+		// TODO: Understand this code after implementing getattr() and put_ref()
+		status = new_fsal_obj_hdl->obj_ops->getattrs(new_fsal_obj_hdl, attrs_out);
+		if (FSAL_IS_ERROR(status)) {
+			new_fsal_obj_hdl->obj_ops->put_ref(new_fsal_obj_hdl);
+			return status;
+		}
+
+		*handle = new_fsal_obj_hdl;
+	}
+
+	return status;
 }
 
 /**
@@ -915,7 +952,7 @@ fsal_status_t dotfs_handle_to_wire(const struct fsal_obj_handle *obj_hdl,
 				   struct gsh_buffdesc *fh_desc)
 {
 	const dotfs_fsal_obj_handle_t *myself =
-		container_of(obj_hdl, dotfs_fsal_obj_handle_t, obj_handle);
+		container_of(obj_hdl, dotfs_fsal_obj_handle_t, fsal_handle);
 
 	if (fh_desc->len < myself->handle.handle_len)
 		return fsalstat(ERR_FSAL_TOOSMALL, 0);

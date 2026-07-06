@@ -103,6 +103,7 @@ fsal_status_t dotfs_create_export(struct fsal_module *fsal_hdl,
     // vfs_state_init();
 
     myself = gsh_calloc(1, sizeof(dotfs_fsal_export_t));
+    myself->root_handle = NULL;
 
     fsal_export_init(&myself->export);
     dotfs_export_ops_init(&myself->export.exp_ops);
@@ -119,6 +120,18 @@ fsal_status_t dotfs_create_export(struct fsal_module *fsal_hdl,
 		goto err_free;
 	}
 
+    myself->export_id = op_ctx->ctx_export->export_id;
+    if (CTX_FULLPATH(op_ctx)) {
+        if (myself->export_path != NULL) {
+            gsh_free(myself->export_path);
+            myself->export_path = NULL;
+        }
+        myself->export_path = gsh_strdup(CTX_FULLPATH(op_ctx));
+    }
+
+    LogInfoMsg("DOTFS export parameters: export_id=%" PRIu64 ", path=%s",
+                myself->export_id, myself->export_path);
+
     myself->export.fsal = fsal_hdl;
 
     rc = fsal_attach_export(fsal_hdl, &myself->export.exports);
@@ -127,12 +140,19 @@ fsal_status_t dotfs_create_export(struct fsal_module *fsal_hdl,
 		goto err_cleanup;
 	}
 
+    // TODO: Revisit here for fsid generation
+    fsal_fsid_t fsid = { .major = 0x12345678, .minor = 0x1 };
+
+    struct fsal_attrlist root_attrs;
+	set_root_attrs(&root_attrs, myself->export_id, fsid);
+
+    myself->root_handle = dotfs_alloc_handle(myself, &root_attrs,
+                                HANDLE_TYPE_GLOBAL_ROOT, myself->export_path);
+
     op_ctx->fsal_export = &myself->export;
 
-    // LogEventMsg("[DotFS] Export %u created and attached successfully for path: %s", 
-    //             myself->export_id, myself->export_path);
-    LogEventMsg("Export created and attached successfully for path: %s", 
-                myself->export_path);
+    LogEventMsg("Export %lu created and attached successfully for path: %s", 
+                myself->export_id, myself->export_path);
     return fsalstat(ERR_FSAL_NO_ERROR, 0);
 
 err_cleanup:
@@ -210,16 +230,19 @@ static void dotfs_export_release(struct fsal_export *exp_hdl)
     dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
 
     // TODO: Change this to debug log
-    LogInfoMsg("Releasing DOTFS export %" PRIu16 " path=%s",
-		 exp_hdl->export_id, myself->root_path ? myself->root_path : "(null)");
+    LogInfoMsg("Releasing DOTFS export id=%u, path=%s",
+		 exp_hdl->export_id, myself->export_path);
 
 	/* TODO: flush in-flight I/O before closing the VFS context. */
     
     dotfs_close_ctx(myself->dotfs_ctx);
     myself->dotfs_ctx = NULL;
     
-    gsh_free(myself->root_path);
-	myself->root_path = NULL;
+    gsh_free(myself->export_path);
+	myself->export_path = NULL;
+
+    gsh_free(myself->root_handle);
+    myself->root_handle = NULL;
 
 	/* Detach from Ganesha's export registry and free export ops. */
     fsal_detach_export(exp_hdl->fsal, &exp_hdl->exports);
@@ -249,36 +272,28 @@ fsal_status_t dotfs_export_lookup_path(struct fsal_export *exp_hdl, const char *
 {
     LogInfoMsg("Resolving path '%s' for export", path);
 
-    dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
-	// struct fsal_attrlist attrs;
-    // dotfs_fsal_obj_handle_t *obj_handle = NULL;
-    // fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
+    if (!exp_hdl || !path || !obj_hdl || !attrs_out) {
+        return fsalstat(ERR_FSAL_FAULT, 0);
+    }
 
-    // dotfs_file_handle_t *file_handle = NULL;
+    *obj_hdl = NULL;
 
-    // TODO: Remove me
-    LogInfoMsg("Export path is '%s', requested path is '%s'", myself->export_path, path);
-    
-    // if (strcmp(path, myself->export_path) != 0) {
-	// 	/* Lookup of a path other than the export's root. */
-	// 	LogErrorMsg("Attempt to lookup non-root path %s", path);
-	// 	return fsalstat(ERR_FSAL_NOENT, ENOENT);
-	// }
+    /* 
+     * Enforce that this placeholder export only boots if the config 
+     * path matches your expected placeholder root exactly.
+     */
+    if (strcmp(path, "/") != 0) {
+        LogCrit(COMPONENT_FSAL, "DOTFS does not support exporting nested physical paths directly: %s", path);
+        return fsalstat(ERR_FSAL_INVAL, 0);
+    }
 
-    // High-Level Logic: What your implementation must do
-    // When Ganesha invokes your myfs_lookup_path, your code will typically follow these steps:
-    //      1. Sanity Check & Context: Upcast exp_hdl to your private structure. 
-    //         Verify the incoming path string isn't null or empty.
-    //      2. Backend Query: Tell your custom storage backend, "Hey, look up the folder
-    //         located at path. Give me its internal ID/Inode and its current permissions."
-    //      3. Handle Allocation: Allocate memory for your custom object handle (which wraps
-    //         struct fsal_obj_handle).
-    //      4. Populate Handle: Fill it with the backend ID and assign your object operations
-    //         (fsal_obj_ops) to it.
-    //      5. Populate Attributes: Fill the attrs_out structure with the backend permissions
-    //         (e.g., owner, group, mode 0755).
-    //      6. Return: Set *handle = &your_new_handle->obj_handle; and return status_success().
-    return fsalstat(ERR_FSAL_NOTSUPP, 0);
+    dotfs_fsal_obj_handle_t *root_handle = container_of(exp_hdl, dotfs_fsal_export_t, export)->root_handle;
+
+    *obj_hdl = &root_handle->fsal_handle;
+
+    LogInfoMsg("Successfully created Global Root Handle for path: %s", path);
+
+    return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
@@ -499,7 +514,7 @@ void dotfs_export_get_fsal_obj_hdl(struct fsal_export *exp_hdl, struct fsal_fd *
     my_fd = container_of(fd, dotfs_fd_t, fsal_fd);
     myself = container_of(my_fd, dotfs_fsal_obj_handle_t, u.file.fd);
 
-    *handle = &myself->obj_handle;
+    *handle = &myself->fsal_handle;
 }
 
 /**

@@ -90,6 +90,12 @@ typedef enum {
 	DFS_FAIL = 0x01,
 } dfs_status_t;
 
+typedef enum {
+    HANDLE_TYPE_GLOBAL_ROOT = 1,
+    HANDLE_TYPE_EXPORT_ROOT,
+    HANDLE_TYPE_REGULAR_FILE_OR_DIR
+} handle_type_t;
+
 /* Runtime socket context structure */
 typedef struct {
 	char *inbound_socket_path;
@@ -104,22 +110,6 @@ typedef struct {
 typedef struct {
 
 } dotfs_context_t;
-
-/* ---------------------------------------------------------------------------
- * Module-level private storage
- *
- * Embeds fsal_module so that container_of() can cast back and forth between
- * the Ganesha generic type and our private extension.
- * ------------------------------------------------------------------------- */
-struct dotfs_fsal_module {
-	struct fsal_module module;
-	struct fsal_obj_ops handle_ops;
-
-	// Socket details for talking to the dotfs daemon.
-	socket_context_t sock_ctx;
-};
-
-typedef struct dotfs_fsal_module dotfs_fsal_module_t;
 
 /* ---------------------------------------------------------------------------
  * Per-file-descriptor state
@@ -165,15 +155,25 @@ typedef struct {
 	uint16_t handle_len;
 } dotfs_file_handle_t;
 
+typedef struct dotfs_fsal_export dotfs_fsal_export_t;
+
 typedef struct {
 	/** Ganesha generic object handle */
-	struct fsal_obj_handle obj_handle;
+	struct fsal_obj_handle fsal_handle;
 
 	/** Serialised dotfs file handle used as a stable NFS FH payload. */
 	dotfs_file_handle_t handle;
 
+	/* Export that owns this handle */
+	dotfs_fsal_export_t *parent_export;
+
 	/** Upcall vector for cache invalidation / layout recalls. */
 	const struct fsal_up_vector *up_ops;
+
+	pthread_mutex_t obj_mutex;	/* Thread safety for internal updates */
+
+	handle_type_t type;		/* Type of the object handle */
+	char *object_key;		/* Key for the object handle */
 
 	/** Per-type union of additional state. */
 	union {
@@ -206,24 +206,37 @@ typedef struct {
 
 /** Convenience cast: fsal_obj_handle → dotfs_fsal_obj_handle */
 #define DOTFS_OBJ(fsal_hdl) \
-	container_of((fsal_hdl), dotfs_fsal_obj_handle_t, obj_handle)
+	container_of((fsal_hdl), dotfs_fsal_obj_handle_t, fsal_handle)
+
 
 /* ---------------------------------------------------------------------------
- * Module / export lifecycle  (export.c)
+ * Module-level private storage
+ *
+ * Embeds fsal_module so that container_of() can cast back and forth between
+ * the Ganesha generic type and our private extension.
  * ------------------------------------------------------------------------- */
+struct dotfs_fsal_module {
+	struct fsal_module module;
+	struct fsal_obj_ops handle_ops;
 
-typedef struct {
-	/** Ganesha generic export handle */
+	// Socket details for talking to the dotfs daemon.
+	socket_context_t sock_ctx;
+};
+
+typedef struct dotfs_fsal_module dotfs_fsal_module_t;
+
+
+struct dotfs_fsal_export {
+	/** Ganesha generic export handle - Must be first member */
 	struct fsal_export export;
 
 	/**
 	 * Root path inside the dotfs namespace that this export exposes.
 	 * Allocated on export creation; freed in dotfs_export_release().
 	 */
-	char *root_path;
-	// dotfs_fsal_obj_handle_t *root_handle;
-
 	char *export_path;
+	uint64_t export_id;
+	dotfs_fsal_obj_handle_t *root_handle;
 
 	/**
 	 * Opaque handle to the dotfs VFS context (Go-layer handle).
@@ -233,7 +246,8 @@ typedef struct {
 	dotfs_context_t *dotfs_ctx;
 
 	socket_context_t *shared_sock_ctx;
-} dotfs_fsal_export_t;
+};
+
 
 /**
  * @brief Create a new dotfs export instance.
@@ -363,7 +377,18 @@ struct state_t *dotfs_alloc_state(struct fsal_export *exp_hdl,
 				  struct state_t *related_state);
 
 /* ---------------------------------------------------------------------------
- * Socket Helpers  (sock.c)
+ * General Helpers (helpers.c)
+ * ------------------------------------------------------------------------- */
+
+void set_root_attrs(struct fsal_attrlist *attrs, uint64_t fileid,
+            fsal_fsid_t fsid);
+dotfs_fsal_obj_handle_t *dotfs_alloc_handle(dotfs_fsal_export_t *exp_hdl,
+                                            struct fsal_attrlist *attr,
+                                            handle_type_t type,
+                                            const char *backend_key);
+
+/* ---------------------------------------------------------------------------
+ * Socket Helpers (sock.c)
  * ------------------------------------------------------------------------- */
 
 dfs_status_t initialize_socket_ctx(socket_context_t *ctx);
@@ -377,5 +402,14 @@ dfs_status_t socket_read_message(int fd, uint8_t *buffer, size_t total_len);
 ssize_t socket_send_message(int fd, const uint8_t *buffer, size_t len);
 
 void socket_close(socket_context_t *ctx);
+
+/* ---------------------------------------------------------------------------
+ * Storage Backend Helpers (storage.c)
+ * ------------------------------------------------------------------------- */
+
+fsal_status_t storage_export_lookup(dotfs_fsal_obj_handle_t *my_parent,
+        const char *name, struct fsal_obj_handle **new_fsal_hdl);
+fsal_status_t storage_file_or_dir_lookup(dotfs_fsal_obj_handle_t *my_parent,
+        const char *name, struct fsal_obj_handle **new_fsal_hdl);
 
 #endif /* DOTFS_H */
