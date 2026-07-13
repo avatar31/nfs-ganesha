@@ -140,15 +140,6 @@ fsal_status_t dotfs_create_export(struct fsal_module *fsal_hdl,
 		goto err_cleanup;
 	}
 
-    // TODO: Revisit here for fsid generation
-    fsal_fsid_t fsid = { .major = 0x12345678, .minor = 0x1 };
-
-    struct fsal_attrlist root_attrs;
-	set_root_attrs(&root_attrs, myself->export_id, fsid);
-
-    myself->root_handle = dotfs_alloc_handle(myself, &root_attrs,
-                                HANDLE_TYPE_GLOBAL_ROOT, myself->export_path);
-
     op_ctx->fsal_export = &myself->export;
 
     LogEventMsg("Export %lu created and attached successfully for path: %s", 
@@ -212,7 +203,10 @@ fsal_status_t dotfs_update_export(struct fsal_module *fsal_hdl,
     //   4. For any immutable parameters that have changed (e.g. export path), log a warning and ignore the change, since we cannot update those without tearing down the export.
     //   5. Return FSAL_NO_ERROR on success, or an appropriate error code on failure.
 
-    fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
+    fsal_status_t status = { ERR_FSAL_NOTSUPP, 0 };
+
+    LogInfoMsg("dotfs_update_export: Not implemented yet. Returning ENOTSUPP.");
+
     return status;
 }
 
@@ -278,20 +272,31 @@ fsal_status_t dotfs_export_lookup_path(struct fsal_export *exp_hdl, const char *
 
     *obj_hdl = NULL;
 
-    /* 
+    /*
      * Enforce that this placeholder export only boots if the config 
      * path matches your expected placeholder root exactly.
      */
-    if (strcmp(path, "/") != 0) {
+    if (strcmp(path, CTX_FULLPATH(op_ctx)) != 0) {
         LogCrit(COMPONENT_FSAL, "DOTFS does not support exporting nested physical paths directly: %s", path);
         return fsalstat(ERR_FSAL_INVAL, 0);
     }
 
-    dotfs_fsal_obj_handle_t *root_handle = container_of(exp_hdl, dotfs_fsal_export_t, export)->root_handle;
+    dotfs_fsal_export_t *export = container_of(exp_hdl, dotfs_fsal_export_t, export);
 
-    *obj_hdl = &root_handle->fsal_handle;
+    // TODO: Revisit here for fsid generation
+    fsal_fsid_t fsid = { .major = 0x12345678, .minor = 0x1 };
 
-    LogInfoMsg("Successfully created Global Root Handle for path: %s", path);
+    struct fsal_attrlist root_attrs;
+	set_root_attrs(&root_attrs, export->export_id, fsid);
+
+
+    export->root_handle = dotfs_alloc_handle(export, &root_attrs,
+                HANDLE_TYPE_GLOBAL_ROOT, export->export_path);
+
+    fsal_copy_attrs(&root_attrs, attrs_out, false);
+    *obj_hdl = &export->root_handle->fsal_handle;
+
+    LogInfoMsg("Successfully created Global Root Handle for path: %s (%p)", path, *obj_hdl);
 
     return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
@@ -315,7 +320,22 @@ fsal_status_t dotfs_export_create_handle(struct fsal_export *exp_hdl,
 				  struct fsal_obj_handle **obj_hdl,
 				  struct fsal_attrlist *attrs_out)
 {
-    LogInfoMsg("Reconstructing object handle from raw descriptor");
+    dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
+
+    dotfs_file_handle_t *fh = (dotfs_file_handle_t *) hdl_desc->addr;
+    fh->handle_len = le16toh(fh->handle_len);
+    
+    LogInfoMsg("Reconstructing object handle from raw descriptor for '%s'", (char *) fh->handle_data);
+
+    fsal_fsid_t fsid = { .major = 0x12345678, .minor = 0x1 };
+    struct fsal_attrlist root_attrs;
+	set_root_attrs(&root_attrs, myself->export_id, fsid);
+    
+    *obj_hdl = NULL;
+    dotfs_fsal_obj_handle_t *dotfs_obj_handle = dotfs_alloc_handle(myself, &root_attrs,
+                                HANDLE_TYPE_GLOBAL_ROOT, fh->handle_data);
+
+    *obj_hdl = &dotfs_obj_handle->fsal_handle;
 
     // High-Level Logic: What your implementation must do
     // When Ganesha invokes your myfs_create_handle, your code will typically follow these steps:
@@ -326,43 +346,55 @@ fsal_status_t dotfs_export_create_handle(struct fsal_export *exp_hdl,
     //      5. Set Operations: Assign file or directory operations (fsal_obj_ops) to this newly resurrected handle so Ganesha knows how to read/write to it.
     //      6. Return: Assign the output pointer and return ERR_FSAL_NO_ERROR.
 
-	return fsalstat(ERR_FSAL_NOTSUPP, 0);
+	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- * @brief Translates an opaque network file handle (wire) into a live memory object (host).
+ * @brief Decode a digested handle
  *
- * This handler acts as the decoder for incoming network requests. It takes a raw, 
- * serialized byte array sent by an NFS client, extracts the backend storage 
- * identifiers, and hooks them back into a live in-memory FSAL handle structure.
+ * This function decodes a previously digested handle.
  *
- * @param[in]  exp_hdl     Pointer to the generic Ganesha export structure.
- * @param[in]  wire_buf    The raw byte descriptor received directly from the network packet.
- * @param[out] host_handle Pointer to store the reconstructed, live memory object handle.
- * @param[out] attrs_out   Pointer to store the object's metadata attributes retrieved during lookup.
- * 
- * @return fsal_status_t   Returns success status or an appropriate FSAL error code.
+ * @param[in]  exp_hdl  Handle of the relevant fs export
+ * @param[in]  in_type  The type of digest being decoded
+ * @param[out] fh_desc  Address and length of key
+ * @param[in]  flags    Flags for the operation
  */
 static fsal_status_t dotfs_export_wire_to_host(struct fsal_export *exp_hdl,
 					fsal_digesttype_t in_type,
 					struct gsh_buffdesc *fh_desc, int flags)
 {
-    // High-Level Logic: What your implementation must do
-    // When Ganesha invokes your myfs_wire_to_host, your code will typically follow these steps:
-    //      1. Decode: Interpret the raw bytes in fh_desc->addr according to your FSAL's wire format. This may involve deserializing a struct or extracting a unique identifier.
-    //      2. Validate: Ensure the decoded identifier is valid and corresponds to an object in your backend storage. If not, return an error.
-    //      3. Lookup: Use the decoded identifier to query your backend storage and retrieve the corresponding object. This may involve checking a database, filesystem, or other storage mechanism.
-    //      4. Allocate Handle: If the object is found, allocate memory for your custom FSAL object handle structure and populate it with the retrieved information.
-    //      5. Set Operations: Assign the appropriate fsal_obj_ops to the newly created handle so Ganesha knows how to perform operations on it.
-    //      6. Return: Assign the output pointer and return ERR_FSAL_NO_ERROR if successful, or an appropriate error code if any step fails.
-    // 
-    // Critical Rules for Writing a Wire-to-Host Handler:
-    //      1. Never Trust the Wire: The incoming byte array comes from the network. Always validate that the handle size matches what your FSAL expects before casting it, otherwise a malicious or broken client could cause a buffer overflow.
-    //      2. Be Fast: This function is in the hot path of almost every disconnected NFS request. Keep your wire-decoding math lightweight.
+    dotfs_file_handle_t *fh = (dotfs_file_handle_t *)fh_desc->addr;
 
-    LogInfoMsg("Translating wire handle to host object");
+    LogInfoMsg("Decoding digested handle of type %d of len=%lu", in_type, fh_desc->len);
 
-	return fsalstat(ERR_FSAL_NOTSUPP, 0);
+    // if (fh_desc->len < sizeof(uint16_t)) {
+    //     LogMajor(COMPONENT_FSAL, "Incoming file handle buffer is too small");
+    //     return fsalstat(ERR_FSAL_SERVERFAULT, 0);
+    // }
+
+    switch (in_type) {
+    case FSAL_DIGEST_NFSV3:
+    case FSAL_DIGEST_NFSV4:
+        /* 
+         * Convert the 16-bit handle_len from network format (Little-Endian / Wire format)
+         * to Host native format.
+         */
+        fh->handle_len = le16toh(fh->handle_len);
+
+        if (fh->handle_len > DOTFS_HANDLE_MAX_LEN) {
+            LogMajor(COMPONENT_FSAL, "Malformed handle: handle_len (%u) exceeds maximum (%d)", 
+                     fh->handle_len, DOTFS_HANDLE_MAX_LEN);
+            return fsalstat(ERR_FSAL_SERVERFAULT, 0);
+        }
+
+        fh_desc->len = sizeof(uint16_t) + fh->handle_len;
+        break;
+
+    default:
+        return fsalstat(ERR_FSAL_SERVERFAULT, 0);
+    }
+
+    return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
@@ -382,16 +414,15 @@ static fsal_status_t dotfs_export_get_fs_dynamic_info(struct fsal_export *exp_hd
 				      struct fsal_obj_handle *obj_hdl,
 				      fsal_dynamicfsinfo_t *info)
 {
-    LogInfoMsg("Fetching dynamic filesystem statistics");
-
-    // dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
+    dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
     // struct myfs_backend_stats stats;
     // int rc;
 
-    // /* Step 1: Sanity checks and upcasting */
-    // if (exp_hdl == NULL || info == NULL) {
-    //     return fsalstat(ERR_FSAL_FAULT, EINVAL);
-    // }
+    if (!exp_hdl || !info || !obj_hdl) {
+        return fsalstat(ERR_FSAL_FAULT, EINVAL);
+    }
+
+    LogInfoMsg("Returning dynamic file system statistics for export=%s", myself->export_path);
 
     // /* Step 2: Query your backend storage for its raw numbers */
     // rc = myfs_backend_query_space(myself->dotfs_ctx, &stats);
@@ -417,14 +448,24 @@ static fsal_status_t dotfs_export_get_fs_dynamic_info(struct fsal_export *exp_hd
     // info->total_files = stats.total_inodes;
     // info->free_files  = stats.free_inodes;
 
-    // /* 
-    //  * Set file timestamp granularity. 
-    //  * E.g., 1 = 1-second resolution, 1000000000 = nanosecond resolution.
-    //  */
-    // info->time_delta.tv_sec = 0;
-    // info->time_delta.tv_nsec = 1; /* Nanosecond precision */
+	memset(info, 0, sizeof(fsal_dynamicfsinfo_t));
 
-    return fsalstat(ERR_FSAL_NOTSUPP, 0);
+    // TODO: Fetch it from storage backend instead of hardcoding
+
+    info->total_bytes = 214748364800;
+    info->free_bytes = 210453397504;
+    info->avail_bytes = 210453397504;
+
+    info->total_files = 1000000;
+    info->free_files = 999000;
+    info->avail_files = 999000;
+
+    // Set file timestamp granularity
+    info->time_delta.tv_sec = 0;
+	info->time_delta.tv_nsec = FSAL_DEFAULT_TIME_DELTA_NSEC;
+
+
+    return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
@@ -441,11 +482,12 @@ static fsal_status_t dotfs_export_get_fs_dynamic_info(struct fsal_export *exp_hd
 static attrmask_t dotfs_export_fs_supported_attrs(struct fsal_export *exp_hdl)
 {
     attrmask_t supported_mask;
+    dotfs_fsal_export_t *myself = container_of(exp_hdl, dotfs_fsal_export_t, export);
 
-    LogInfoMsg("Reporting supported metadata attributes for export");
+    LogInfoMsg("Reporting supported metadata attributes for export %s", myself->export_path);
 
     supported_mask = fsal_supported_attrs(&exp_hdl->fsal->fs_info);
-	// supported_mask &= ~ATTR_ACL;
+	supported_mask &= ~ATTR_ACL;
 
     return supported_mask;
 }

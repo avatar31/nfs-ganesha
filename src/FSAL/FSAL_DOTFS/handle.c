@@ -27,6 +27,12 @@
 
 #include "dotfs.h"
 
+/**
+ * TODO:
+ *    	1. Handle stale entries in all handlers before returning success.  If the object is gone, return ERR_FSAL_STALE.
+ *  	2. 
+ */
+
 
 /**
  * dotfs_handle_ops_init — populate the fsal_obj_ops table for DOTFS.
@@ -90,6 +96,12 @@ void dotfs_handle_ops_init(struct fsal_obj_ops *ops)
  */
 void dotfs_release_obj(struct fsal_obj_handle *obj_hdl)
 {
+	dotfs_fsal_obj_handle_t *hdll = DOTFS_OBJ(obj_hdl);
+
+    LogInfoMsg("dotfs_release_obj: Releasing handle for key %s", hdll->object_key);
+
+	gsh_free(hdll->object_key);
+	gsh_free(hdll);
 }
 
 /**
@@ -113,13 +125,15 @@ fsal_status_t dotfs_merge(struct fsal_obj_handle *orig_hdl,
 	// TODO: transfer open-state / share-reservation data from dupe to orig
 	// once NFSv4 state is implemented.
 
+	dotfs_fsal_obj_handle_t *orig = DOTFS_OBJ(orig_hdl);
+	dotfs_fsal_obj_handle_t *dupe = DOTFS_OBJ(dupe_hdl);
+
 	if (orig_hdl->type == REGULAR_FILE && dupe_hdl->type == REGULAR_FILE) {
-		/* TODO: merge share reservations.
-		 *   dotfs_fsal_obj_handle_t *orig = DOTFS_OBJ(orig_hdl);
-		 *   dotfs_fsal_obj_handle_t *dupe = DOTFS_OBJ(dupe_hdl);
-		 *   status = merge_share(&orig->u.file.share, &dupe->u.file.share);
-		 */
+		status = merge_share(orig_hdl, &orig->u.file.share, &dupe->u.file.share);
 	}
+
+    LogInfoMsg("dotfs_merge: Merging duplicate handle %s into original handle %s",
+			   dupe->object_key, orig->object_key);
 
 	return status;
 }
@@ -149,6 +163,8 @@ fsal_status_t dotfs_lookup(struct fsal_obj_handle *parent, const char *name,
 	fsal_status_t status = {ERR_FSAL_NO_ERROR, 0};
     dotfs_fsal_obj_handle_t *my_parent = NULL;
     struct fsal_obj_handle *new_fsal_obj_hdl = NULL;
+
+	LogInfoMsg("dotfs_lookup: Looking up name '%s' in parent handle %p", name, (void *)parent);
 
 	if (!parent || !name || !handle || !attrs_out) {
         return fsalstat(ERR_FSAL_FAULT, 0);
@@ -235,16 +251,15 @@ fsal_status_t dotfs_readdir(struct fsal_obj_handle *dir_hdl,
 	 *   For each entry: build handle, call cb(name, hdl, attrs, dir_state, &cookie).
 	 *   Set *eof when IterateByPrefix returns empty next cursor.
 	 */
-	(void)dir_hdl;
-    (void)whence;
-    (void)dir_state;
-    (void)cb;
-    (void)attrmask;
 
-    if (eof != NULL) {
-        *eof = true; // Tell Ganesha there's nothing here to read
-    }
-    return fsalstat(ERR_FSAL_NOTSUPP, 0);
+	dotfs_fsal_export_t *exp = container_of(op_ctx->fsal_export, dotfs_fsal_export_t, export);
+	dotfs_fsal_obj_handle_t *dir = DOTFS_OBJ(dir_hdl);
+
+	LogInfoMsg("dotfs_readdir: Reading directory %s in export %s", dir->object_key, exp->export_path);
+
+    *eof = true;
+
+    return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
@@ -287,6 +302,8 @@ fsal_status_t dotfs_mkdir(struct fsal_obj_handle *dir_hdl, const char *name,
 	if (new_obj != NULL) {
         *new_obj = NULL; 
     }
+
+	LogInfoMsg("dotfs_mkdir: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -327,6 +344,7 @@ fsal_status_t dotfs_mknode(struct fsal_obj_handle *dir_hdl, const char *name,
         *handle = NULL; 
     }
 
+	LogInfoMsg("dotfs_mknode: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -367,6 +385,7 @@ fsal_status_t dotfs_symlink(struct fsal_obj_handle *dir_hdl, const char *name,
         *handle = NULL; 
     }
 
+	LogInfoMsg("dotfs_symlink: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -399,6 +418,8 @@ fsal_status_t dotfs_readlink(struct fsal_obj_handle *obj_hdl,
 	(void)obj_hdl;
 	(void)link_content;
 	(void)refresh;
+
+	LogInfoMsg("dotfs_readlink: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -430,12 +451,17 @@ fsal_status_t dotfs_getattrs(struct fsal_obj_handle *obj_hdl,
 	 *   if (!meta) return fsalstat(ERR_FSAL_STALE, 0);
 	 *   populate attrs_out from meta fields.
 	 */
-	(void)obj_hdl;
+	dotfs_fsal_obj_handle_t *myself = DOTFS_OBJ(obj_hdl);
+
+	LogInfoMsg("Returning cached attributes for object %s", myself->object_key);
 
     if (attrs_out != NULL) {
         memset(attrs_out, 0, sizeof(struct fsal_attrlist));
     }
-    return fsalstat(ERR_FSAL_NOTSUPP, 0);
+
+	fsal_copy_attrs(attrs_out, &myself->attrs, false);
+
+    return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
@@ -465,6 +491,8 @@ fsal_status_t dotfs_link(struct fsal_obj_handle *obj_hdl,
 	(void)obj_hdl;
 	(void)destdir_hdl;
 	(void)name;
+
+	LogInfoMsg("dotfs_link: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -505,6 +533,8 @@ fsal_status_t dotfs_rename(struct fsal_obj_handle *obj_hdl,
 	(void)old_name;
 	(void)newdir_hdl;
 	(void)new_name;
+
+	LogInfoMsg("dotfs_rename: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -538,6 +568,8 @@ fsal_status_t dotfs_unlink(struct fsal_obj_handle *dir_hdl,
 	(void)dir_hdl;
 	(void)obj_hdl;
 	(void)name;
+
+	LogInfoMsg("dotfs_unlink: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -571,6 +603,8 @@ fsal_status_t dotfs_setattrs(struct fsal_obj_handle *obj_hdl, bool bypass,
 	(void)bypass;
 	(void)state;
 	(void)attrib_set;
+
+	LogInfoMsg("dotfs_setattrs: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -639,6 +673,8 @@ fsal_status_t dotfs_open2(struct fsal_obj_handle *obj_hdl,
 	(void)caller_perm_check;
 	(void)parent_pre_attrs_out;
 	(void)parent_post_attrs_out;
+
+	LogInfoMsg("dotfs_open2: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -665,6 +701,9 @@ fsal_openflags_t dotfs_status2(struct fsal_obj_handle *obj_hdl,
 	 */
 	(void)obj_hdl;
 	(void)state;
+
+	LogInfoMsg("dotfs_status2: Not implemented yet. Returning FSAL_O_CLOSED.");
+
 	return FSAL_O_CLOSED;
 }
 
@@ -694,6 +733,8 @@ fsal_status_t dotfs_reopen2(struct fsal_obj_handle *obj_hdl,
 	(void)obj_hdl;
 	(void)state;
 	(void)openflags;
+
+	LogInfoMsg("dotfs_reopen2: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -733,6 +774,8 @@ void dotfs_read2(struct fsal_obj_handle *obj_hdl, bool bypass,
 	(void)obj_hdl;
 	(void)bypass;
 	(void)read_arg;
+
+	LogInfoMsg("dotfs_read2: Not implemented yet. Returning ENOTSUPP.");
 	done_cb(obj_hdl, fsalstat(ERR_FSAL_NOTSUPP, 0), read_arg, caller_arg);
 }
 
@@ -774,6 +817,8 @@ void dotfs_write2(struct fsal_obj_handle *obj_hdl, bool bypass,
 	(void)obj_hdl;
 	(void)bypass;
 	(void)write_arg;
+
+	LogInfoMsg("dotfs_write2: Not implemented yet. Returning ENOTSUPP.");
 	done_cb(obj_hdl, fsalstat(ERR_FSAL_NOTSUPP, 0), write_arg, caller_arg);
 }
 
@@ -805,6 +850,8 @@ fsal_status_t dotfs_commit2(struct fsal_obj_handle *obj_hdl, off_t offset,
 	(void)obj_hdl;
 	(void)offset;
 	(void)len;
+
+	LogInfoMsg("dotfs_commit2: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -838,6 +885,8 @@ fsal_status_t dotfs_close2(struct fsal_obj_handle *obj_hdl,
 	 */
 	(void)obj_hdl;
 	(void)state;
+
+	LogInfoMsg("dotfs_close2: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -878,6 +927,8 @@ fsal_status_t dotfs_lock_op2(struct fsal_obj_handle *obj_hdl,
 	(void)lock_op;
 	(void)request_lock;
 	(void)conflicting_lock;
+
+	LogInfoMsg("dotfs_lock_op2: Not implemented yet. Returning ENOTSUPP.");
 	return fsalstat(ERR_FSAL_NOTSUPP, 0);
 }
 
@@ -897,6 +948,8 @@ fsal_status_t dotfs_close(struct fsal_obj_handle *obj_hdl)
 
 	if (obj_hdl->type != REGULAR_FILE)
 		return fsalstat(ERR_FSAL_BADTYPE, 0);
+
+	LogInfoMsg("Closing object %s", myself->object_key);
 
 	/* TODO: guard with the handle's content lock once added. */
 	return dotfs_close_my_fd(&myself->u.file.fd);
@@ -920,8 +973,7 @@ fsal_status_t dotfs_close_my_fd(dotfs_fd_t *my_fd)
 	    my_fd->fsal_fd.openflags == FSAL_O_CLOSED)
 		return fsalstat(ERR_FSAL_NOT_OPENED, 0);
 
-	LogFullDebug(COMPONENT_FSAL,
-		     "DOTFS close_my_fd: stream=%p openflags=0x%x",
+	LogInfoMsg("DOTFS close_my_fd: stream=%p openflags=0x%x",
 		     my_fd->dotfs_stream, my_fd->fsal_fd.openflags);
 
 	/* TODO: dotfs_close(my_fd->dotfs_stream); */
@@ -954,15 +1006,26 @@ fsal_status_t dotfs_handle_to_wire(const struct fsal_obj_handle *obj_hdl,
 	const dotfs_fsal_obj_handle_t *myself =
 		container_of(obj_hdl, dotfs_fsal_obj_handle_t, fsal_handle);
 
-	if (fh_desc->len < myself->handle.handle_len)
+	LogInfoMsg("Serialising handle for object %s",
+		     myself->object_key);
+
+	if (fh_desc->len < myself->handle.handle_len) {
 		return fsalstat(ERR_FSAL_TOOSMALL, 0);
+	}
 
 	/* TODO: support output_type variants if needed. */
 	(void)output_type;
 
-	memcpy(fh_desc->addr, myself->handle.handle_data,
+	dotfs_file_handle_t *hhdl = fh_desc->addr;
+
+	memcpy(hhdl->handle_data, myself->handle.handle_data,
 	       myself->handle.handle_len);
-	fh_desc->len = myself->handle.handle_len;
+	hhdl->handle_len = htole64(myself->handle.handle_len);
+
+	fh_desc->len = sizeof(*hhdl);
+
+	LogInfoMsg("dotfs_handle_to_wire: wrote '%s' (%zu bytes) to wire buffer",
+		     (char *) fh_desc->addr, fh_desc->len);
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
@@ -993,8 +1056,11 @@ void dotfs_handle_to_key(struct fsal_obj_handle *obj_hdl,
 	 *   handle_data[0..35]  = 36-char UUID (rename-stable identity)
 	 * Key length = 36.
 	 */
-	fh_desc->addr = myself->handle.handle_data;
-	fh_desc->len = myself->handle.handle_len;
+
+	LogInfoMsg("Returning handle key for object %s", myself->object_key);
+
+	fh_desc->addr = myself->object_key;
+	fh_desc->len = strlen(myself->object_key);
 }
 
 // /**

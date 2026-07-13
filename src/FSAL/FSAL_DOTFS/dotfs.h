@@ -35,6 +35,15 @@
 
 #define FS_NAME "DOTFS"
 
+/* =========================================================================
+ * Supported attribute mask
+ *
+ * ATTRS_POSIX covers the mandatory POSIX attribute set (mode, uid, gid,
+ * size, atime, mtime, ctime, nlink, …).  Extend this once dotfs adds
+ * ACL support (ATTR_ACL) or xattr support (ATTR4_XATTR).
+ * ========================================================================= */
+#define DOTFS_SUPPORTED_ATTRIBUTES ((const attrmask_t)(ATTRS_POSIX))
+
 /**
  * Maximum byte length of a serialised dotfs object handle.
  * Covers a 36-byte UUID string + '/' + up to 1023-char path + NUL.
@@ -160,11 +169,13 @@ typedef struct dotfs_fsal_export dotfs_fsal_export_t;
 typedef struct {
 	/** Ganesha generic object handle */
 	struct fsal_obj_handle fsal_handle;
+	struct fsal_attrlist attrs;
 
 	/** Serialised dotfs file handle used as a stable NFS FH payload. */
 	dotfs_file_handle_t handle;
 
 	/* Export that owns this handle */
+	// TODO: Shall we use op_ctx->export instead of storing a pointer here?
 	dotfs_fsal_export_t *parent_export;
 
 	/** Upcall vector for cache invalidation / layout recalls. */

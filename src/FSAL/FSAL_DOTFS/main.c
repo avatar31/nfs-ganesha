@@ -29,14 +29,6 @@
 
 #include "dotfs.h"
 
-/* =========================================================================
- * Supported attribute mask
- *
- * ATTRS_POSIX covers the mandatory POSIX attribute set (mode, uid, gid,
- * size, atime, mtime, ctime, nlink, …).  Extend this once dotfs adds
- * ACL support (ATTR_ACL) or xattr support (ATTR4_XATTR).
- * ========================================================================= */
-#define DOTFS_SUPPORTED_ATTRIBUTES ((const attrmask_t)(ATTRS_POSIX))
 
 static dotfs_fsal_module_t DOTFS = {
     .module = {

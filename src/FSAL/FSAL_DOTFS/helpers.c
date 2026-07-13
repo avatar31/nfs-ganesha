@@ -36,6 +36,8 @@
 void set_root_attrs(struct fsal_attrlist *attrs, uint64_t fileid,
             fsal_fsid_t fsid)
 {
+    memset(attrs, 0, sizeof(struct fsal_attrlist));
+
     attrs->request_mask = ATTR_TYPE | ATTR_MODE | ATTR_NUMLINKS | ATTR_OWNER | 
                           ATTR_GROUP | ATTR_SIZE | ATTR_FILEID | ATTR_FSID;
 
@@ -57,8 +59,15 @@ void set_root_attrs(struct fsal_attrlist *attrs, uint64_t fileid,
      * will experience mounting conflicts (such as masking or caching overlap bugs).
      */
     attrs->fsid = fsid;
+
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    attrs->atime = now;
+    attrs->mtime = now;
+    attrs->ctime = now;
     
     attrs->valid_mask = attrs->request_mask;
+    attrs->supported = DOTFS_SUPPORTED_ATTRIBUTES | ATTR_FSID | ATTR_FILEID;
 }
 
 dotfs_fsal_obj_handle_t *dotfs_alloc_handle(dotfs_fsal_export_t *exp_hdl,
@@ -93,6 +102,8 @@ dotfs_fsal_obj_handle_t *dotfs_alloc_handle(dotfs_fsal_export_t *exp_hdl,
     hdl->type = type;
     pthread_mutex_init(&hdl->obj_mutex, NULL);
 
+    hdl->handle.handle_len = snprintf((char *) hdl->handle.handle_data, sizeof(hdl->handle.handle_data), "%s", hdl->object_key);
+
     hdl->fsal_handle.type = attr->type;       /* DIRECTORY, REGULAR_FILE, etc. */
     hdl->fsal_handle.fsid = attr->fsid;       /* Filesystem ID identifier */
     hdl->fsal_handle.fileid = attr->fileid;   /* The unguessable unique 64-bit inode */
@@ -102,6 +113,8 @@ dotfs_fsal_obj_handle_t *dotfs_alloc_handle(dotfs_fsal_export_t *exp_hdl,
 
     /* Setup Global Core Vtable Reference */
     hdl->fsal_handle.obj_ops = &my_module->handle_ops;
+
+    fsal_copy_attrs(&hdl->attrs, attr, false);
 
     return hdl;
 }
